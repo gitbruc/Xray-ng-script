@@ -61,7 +61,7 @@ In SNI configurations, CDN share links default Alpn to H2. For H3 requirements, 
 
 * Download:
   ```sh
-  wget --no-check-certificate -O ${HOME}/Xray-script.sh https://raw.githubusercontent.com/zxcvos/Xray-script/main/install.sh
+  wget --no-check-certificate -O ${HOME}/Xray-script.sh https://raw.githubusercontent.com/gitbruc/Xray-ng-script/main/install.sh
   ```
   
 * Usage
@@ -91,7 +91,7 @@ In SNI configurations, CDN share links default Alpn to H2. For H3 requirements, 
 
 * Quick start (with interface)
   ```sh
-  wget --no-check-certificate -O ${HOME}/Xray-script.sh https://raw.githubusercontent.com/zxcvos/Xray-script/main/install.sh && bash ${HOME}/Xray-script.sh
+  wget --no-check-certificate -O ${HOME}/Xray-script.sh https://raw.githubusercontent.com/gitbruc/Xray-ng-script/main/install.sh && bash ${HOME}/Xray-script.sh
   ```
 
 ## Script Interface
