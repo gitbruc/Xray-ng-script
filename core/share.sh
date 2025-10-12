@@ -225,6 +225,13 @@ function get_tls_down_json() {
     XHTTP_EXTRA=$(
         cat <<EOF
 {
+    "xmux": {
+        "maxConcurrency": "16-32",
+        "cMaxReuseTimes": 0,
+        "hMaxRequestTimes": "800-900",
+        "hMaxReusableSecs": "1800-3000",
+        "hKeepAlivePeriod": 0
+    },
     "downloadSettings": {
         "address": "${server_name}",
         "port": 443,
@@ -241,7 +248,14 @@ function get_tls_down_json() {
         "xhttpSettings": {
             "host": "${server_name}",
             "path": "${sni_path}",
-            "mode": "auto"
+            "mode": "auto",
+            "xmux": {
+                "maxConcurrency": "16-32",
+                "cMaxReuseTimes": 0,
+                "hMaxRequestTimes": "800-900",
+                "hMaxReusableSecs": "1800-3000",
+                "hKeepAlivePeriod": 0
+            }
         }
     }
 }
@@ -276,6 +290,13 @@ function get_reality_down_json() {
     XHTTP_EXTRA=$(
         cat <<EOF
 {
+    "xmux": {
+        "maxConcurrency": "16-32",
+        "cMaxReuseTimes": 0,
+        "hMaxRequestTimes": "800-900",
+        "hMaxReusableSecs": "1800-3000",
+        "hKeepAlivePeriod": 0
+    },
     "downloadSettings": {
         "address": "${server_name}",
         "port": 443,
@@ -292,8 +313,42 @@ function get_reality_down_json() {
         "xhttpSettings": {
             "host": "",
             "path": "${sni_path}",
-            "mode": "auto"
+            "mode": "auto",
+            "xmux": {
+                "maxConcurrency": "16-32",
+                "cMaxReuseTimes": 0,
+                "hMaxRequestTimes": "800-900",
+                "hMaxReusableSecs": "1800-3000",
+                "hKeepAlivePeriod": 0
+            }
         }
+    }
+}
+EOF
+    )
+
+    # 将生成的 JSON 字符串通过管道传递给 jq 格式化，再传递给 urlencode 进行编码
+    XHTTP_EXTRA_ENCODED=$(echo "${XHTTP_EXTRA}" | jq -r '.' | urlencode)
+}
+
+# =============================================================================
+# 函数名称: get_xmux_down_json
+# 功能描述: 生成用于 h2/h3 Mux 的额外配置 JSON 字符串 (XHTTP_EXTRA)，
+#           然后对生成的 JSON 进行 URL 编码 (XHTTP_EXTRA_ENCODED)。
+# 参数: 无
+# 返回值: 无 (直接修改全局变量 XHTTP_EXTRA 和 XHTTP_EXTRA_ENCODED)
+# =============================================================================
+function get_xmux_down_json() {
+    # 使用 Here Document 构造 h2/h3 Mux 下行设置的 JSON 字符串
+    XHTTP_EXTRA=$(
+        cat <<EOF
+{
+    "xmux": {
+        "maxConcurrency": "16-32",
+        "cMaxReuseTimes": 0,
+        "hMaxRequestTimes": "800-900",
+        "hMaxReusableSecs": "1800-3000",
+        "hKeepAlivePeriod": 0
     }
 }
 EOF
@@ -552,8 +607,12 @@ function show_sni_config() {
     get_common_config 2
     # 设置第二个配置的标签为 'sni_xhttp_reality'
     CLIENT_CONFIG[tag]='sni_xhttp_reality'
+    # 生成 Mux 下行的额外配置
+    get_xmux_down_json
     # 生成 fallback 的 XHTTP 分享链接
     get_fallback_xhttp_share_link
+    # 附加 extra 参数
+    SHARE_LINK="${SHARE_LINK}${SHARE_LINK_COMPONENT_EXTRA}"
     # 显示第二个配置
     show_config
 
@@ -574,8 +633,12 @@ function show_sni_config() {
     CLIENT_CONFIG[tag]='sni_xhttp_cdn'
     # 清空额外配置
     XHTTP_EXTRA=""
+    # 生成 Mux 下行的额外配置
+    get_xmux_down_json
     # 生成 SNI TLS 分享链接
     get_sni_tls_share_link
+    # 附加 extra 参数
+    SHARE_LINK="${SHARE_LINK}${SHARE_LINK_COMPONENT_EXTRA}"
     # 显示第四个配置
     show_config
 
