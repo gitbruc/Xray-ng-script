@@ -50,6 +50,9 @@
 3. 使用 SNI 配置前，请不要开启 CDN 保护，不然无法正常申请 SSL 证书。
 4. 上下行分离详情请看 [XHTTP: Beyond REALITY][XHTTP] 与 [xhttp 五合一配置][xhttp 五合一配置] 了解。
 5. 使用 SNI 获取证书时遇到 【Could not get nonce, let's try again】 请查看 [ZeroSSL 状态页](https://status.zerossl.com/)，大概率是 ZeroSSL 的【Free ACME Service】处于 【Service disruption】或【Service outage】状态。
+6. v2025.11.19 版本解决【开启 WARP 时没有设置日志限制，导致容器日志会一直叠加，最终占满硬盘空间】问题。
+   1. 已启动 WARP 分流的用户可以在【管理配置】->【分流管理】中选择【重置 WARP Proxy】选项，该选项实现清空容器日志与重置 WARP Proxy。
+   2. 已添加日志限制，如需使用 WARP 功能直接启用即可。
 
 ## 分享链接
 
@@ -189,9 +192,9 @@ SNI 配置适合安装一次后长期使用，不适合反复重置系统安装�
 
 **Nginx:** `/usr/local/nginx`
 
-**Cloudreve:** `/usr/local/xray-script/docker/cloudreve`
+**Cloudreve:** `$HOME/.xray-script/docker/cloudreve`
 
-**Cloudflare-warp:** `/usr/local/xray-script/docker/warp`
+**Cloudflare-warp:** `$HOME/.xray-script/docker/warp`
 
 **Xray:** 见 **[Xray-install](https://github.com/XTLS/Xray-install)**
 

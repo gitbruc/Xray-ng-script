@@ -652,6 +652,7 @@ function handler_xray_config() {
     local XRAY_RULES_CN="$(echo "${SCRIPT_CONFIG}" | jq -r '.xray.rules.cn')"        # 获取 cn 规则状态
     local XRAY_RULES_AD="$(echo "${SCRIPT_CONFIG}" | jq -r '.xray.rules.ip')"        # 获取 ad 规则状态
     local XRAY_RULES="$(echo "${SCRIPT_CONFIG}" | jq -r '.rules')"                   # 获取路由规则
+    local WARP_STATUS="$(echo "${SCRIPT_CONFIG}" | jq -r '.xray.warp')"              # 获取 WARP 状态
     # 加载对应配置标签的 Xray 配置模板
     XRAY_CONFIG="$(jq '.' ${SCRIPT_XRAY_DIR}/${CONFIG_TAG}.json)"
     # 如果配置标签不是 sni，则更新端口
@@ -711,6 +712,15 @@ function handler_xray_config() {
         [[ "${XRAY_RULES_AD}" -eq 1 ]] && add_rule "ad-domain" "domain" "geosite:category-ads-all" "block"
         ;;
     esac
+	# 处理 WARP 状态
+    if [[ ${WARP_STATUS} -eq 1 ]]; then
+        # 获取 WARP 容器 IP
+        local container_ip="$(exec_docker '--obtain-container-ip')"
+        # 构造 WARP Socks 出站配置 JSON
+        local socks_config='[{"tag":"warp","protocol":"socks","settings":{"servers":[{"address":"'"${container_ip}"'","port":40001}]}}]'
+        # 将 WARP 出站配置添加到 Xray 配置中
+        XRAY_CONFIG=$(echo "${XRAY_CONFIG}" | jq --argjson socks_config "${socks_config}" '.outbounds += $socks_config')
+    fi
     # 获取更新后的路由规则
     XRAY_RULES="$(echo "${XRAY_CONFIG}" | jq '.routing.rules')"
     # 更新脚本配置中的路由规则
@@ -1060,6 +1070,35 @@ function handler_warp() {
     # 将更新后的脚本配置和 Xray 配置写入文件
     echo "${SCRIPT_CONFIG}" >"${SCRIPT_CONFIG_PATH}" && sleep 2
     echo "${XRAY_CONFIG}" >"${XRAY_CONFIG_PATH}" && sleep 2
+}
+
+# =============================================================================
+# 函数名称: handler_reset_warp
+# 功能描述: 重新构建并启动 WARP 容器。
+#           1. 确保 Docker 已安装。
+#           2. 检查当前 WARP 状态。
+#           3. 如果已启用，则执行清空容器日志，并重置 WARP 容器。
+#           4. 如果未启用，则跳过。
+# 参数: 无
+# 返回值: 无 (通过调用其他函数和脚本执行操作)
+# =============================================================================
+function handler_reset_warp() {
+    # 确保 Docker 已安装
+    handler_docker
+    # 从脚本配置中读取当前 WARP 状态
+    local WARP_STATUS="$(echo "${SCRIPT_CONFIG}" | jq -r '.xray.warp')"
+    # 从 Xray 配置文件加载配置
+    XRAY_CONFIG="$(jq '.' "${XRAY_CONFIG_PATH}")"
+    # 如果 WARP 已启用 (状态为 1)
+    if [[ ${WARP_STATUS} -eq 1 ]]; then
+        # 清空 WARP 容器日志数据
+        exec_docker '--clean-container-logs'
+        # 调用 docker.sh 禁用 WARP 容器
+        exec_docker '--disable-warp'
+        # 调用 docker.sh 构建并启用 WARP 容器
+        exec_docker '--build-warp'
+        exec_docker '--enable-warp'
+    fi
 }
 
 # =============================================================================
@@ -1493,6 +1532,7 @@ function main() {
     --nginx-cron) handler_nginx_cron ;;         # 管理 Nginx Cron
     --geodata-cron) handler_geodata_cron ;;     # 管理 GeoData Cron
     --warp) handler_warp ;;                     # 管理 WARP
+    --reset-warp) handler_reset_warp ;;         # 重置 WARP
     --traffic) handler_traffic ;;               # 显示流量统计
     --start) handler_start ;;                   # 启动 Xray
     --stop) handler_stop ;;                     # 停止 Xray
