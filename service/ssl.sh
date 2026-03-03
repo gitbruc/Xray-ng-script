@@ -56,6 +56,8 @@ readonly SSL_CERT_PATH="${NGINX_CONFIG_PATH}/certs" # SSL 证书存储目录
 declare ACTION=''        # 存储用户请求的操作 (如 install, issue)
 declare DOMAIN=''        # 存储要操作的域名
 declare ACCOUNT_EMAIL='' # 存储 acme.sh 账户邮箱
+declare CA_SERVER=''
+declare CA_SERVER_EXPLICIT=0
 declare LANG_PARAM=''    # (未在脚本中实际使用，可能是预留)
 declare I18N_DATA=''     # 存储从 i18n JSON 文件中读取的全部数据
 
@@ -137,6 +139,60 @@ function print_error() {
 }
 
 # =============================================================================
+# 函数名称: normalize_ca_server
+# 功能描述: 规范化 CA 参数，仅允许 zerossl / letsencrypt，非法值回落 zerossl。
+# 参数:
+#   $1: 原始 CA 参数
+# 返回值: 标准化后的 CA 名称
+# =============================================================================
+function normalize_ca_server() {
+    local ca_server="${1:-}"
+    case "${ca_server,,}" in
+    zerossl | letsencrypt)
+        echo "${ca_server,,}"
+        ;;
+    *)
+        echo 'zerossl'
+        ;;
+    esac
+}
+
+# =============================================================================
+# 函数名称: get_config_ca_server
+# 功能描述: 从脚本配置读取 nginx.ca_server，并执行标准化。
+# 返回值: 标准化后的 CA 名称
+# =============================================================================
+function get_config_ca_server() {
+    local config_ca_server="$(jq -r '.nginx.ca_server' "${SCRIPT_CONFIG_PATH}")"
+    normalize_ca_server "${config_ca_server}"
+}
+
+# =============================================================================
+# 函数名称: resolve_ca_server
+# 功能描述: 解析当前生效 CA。
+#           优先使用命令行 --ca 显式值；否则回退到 config.json 的 nginx.ca_server。
+# 返回值: 无（更新全局变量 CA_SERVER）
+# =============================================================================
+function resolve_ca_server() {
+    if [[ -z "${CA_SERVER}" ]]; then
+        CA_SERVER="$(get_config_ca_server)"
+    fi
+    CA_SERVER="$(normalize_ca_server "${CA_SERVER}")"
+}
+
+# =============================================================================
+# 函数名称: set_default_ca
+# 功能描述: 显式设置 acme.sh 默认 CA（不触发签发动作）。
+#           供 handler 的事务切换在重签成功后调用，保证后续 cron/续签一致。
+# 返回值: 0-设置成功；非0-设置失败
+# =============================================================================
+function set_default_ca() {
+    resolve_ca_server
+    [[ -x "${HOME}/.acme.sh/acme.sh" ]] || print_error "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.set_ca.not_installed")"
+    "${HOME}/.acme.sh/acme.sh" --set-default-ca --server "${CA_SERVER}" || print_error "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.install.fail_set_ca")"
+}
+
+# =============================================================================
 # 函数名称: install_acme_sh
 # 功能描述: 安装 acme.sh 脚本。
 # 参数: 无 (使用全局变量 ACCOUNT_EMAIL)
@@ -151,6 +207,7 @@ function install_acme_sh() {
 
     # 打印安装信息
     print_info "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.install.start")"
+    resolve_ca_server
 
     # 使用 curl 下载并运行 acme.sh 安装脚本，设置账户邮箱
     curl https://get.acme.sh | sh -s email="${ACCOUNT_EMAIL}" || print_error "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.install.fail_download")"
@@ -158,8 +215,7 @@ function install_acme_sh() {
     # 启用 acme.sh 的自动升级功能
     "${HOME}/.acme.sh/acme.sh" --upgrade --auto-upgrade || print_error "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.install.fail_autoupgrade")"
 
-    # 设置 acme.sh 的默认 CA 为 ZeroSSL
-    "${HOME}/.acme.sh/acme.sh" --set-default-ca --server zerossl || print_error "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.install.fail_set_ca")"
+    "${HOME}/.acme.sh/acme.sh" --set-default-ca --server "${CA_SERVER}" || print_error "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.install.fail_set_ca")"
 }
 
 # =============================================================================
@@ -214,6 +270,7 @@ function issue_certificate() {
 
     # 定义证书存储路径
     local cert_path="${SSL_CERT_PATH}/${DOMAIN}"
+    resolve_ca_server
 
     # 打印签发信息
     print_info "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.issue.start")"
@@ -263,30 +320,77 @@ EOF
         nginx -t && systemctl start nginx || print_error "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.issue.fail_start_nginx")"
     fi
 
-    # 使用 acme.sh 签发 ECC 证书
-    "${HOME}/.acme.sh/acme.sh" --issue -d ${DOMAIN} \
-        --webroot "${ACME_WEBROOT_PATH}" \
-        --keylength ec-256 \
-        --accountkeylength ec-256 \
-        --server zerossl \
-        --ocsp
+    local issue_output=''
+    local issue_status=1
+    local issue_retry=1
+    local issue_retry_message=''
+    local -a issue_args=(
+        --issue -d "${DOMAIN}"
+        --webroot "${ACME_WEBROOT_PATH}"
+        --keylength ec-256
+        --accountkeylength ec-256
+        --server "${CA_SERVER}"
+    )
+    if [[ "${CA_SERVER}" == 'zerossl' ]]; then
+        issue_args+=(--ocsp)
+    fi
+    if [[ ${CA_SERVER_EXPLICIT} -eq 1 ]]; then
+        issue_args+=(--force)
+    fi
 
-    # 检查签发命令的退出状态
-    local issue_status=$?
-    if [[ ${issue_status} -ne 0 ]]; then
-        # 如果首次签发失败，则尝试启用调试模式重新签发
-        print_warn "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.issue.fail_first_attempt")"
-        "${HOME}/.acme.sh/acme.sh" --issue -d ${DOMAIN} \
-            --webroot "${ACME_WEBROOT_PATH}" \
-            --keylength ec-256 \
-            --accountkeylength ec-256 \
-            --server zerossl \
-            --ocsp \
-            --debug
-        # 恢复原始 Nginx 配置
-        mv -f "${nginx_conf_bak}" "${nginx_conf}"
-        # 打印错误并退出
-        print_error "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.issue.fail_ecc_issue")"
+    if [[ "${CA_SERVER}" == 'letsencrypt' ]]; then
+        issue_status=1
+        for issue_retry in 1 2 3; do
+            issue_retry_message="$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.issue.letsencrypt_retry" | sed "s|\${attempt}|${issue_retry}|g")"
+            print_warn "${issue_retry_message}"
+            issue_output="$("${HOME}/.acme.sh/acme.sh" "${issue_args[@]}" 2>&1)"
+            issue_status=$?
+            [[ -n "${issue_output}" ]] && printf "%s\n" "${issue_output}" >&2
+            [[ ${issue_status} -eq 0 ]] && break
+        done
+        if [[ ${issue_status} -ne 0 ]]; then
+            mv -f "${nginx_conf_bak}" "${nginx_conf}"
+            print_error "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.issue.letsencrypt_fail")"
+        fi
+    else
+        issue_output="$("${HOME}/.acme.sh/acme.sh" "${issue_args[@]}" 2>&1)"
+        issue_status=$?
+        [[ -n "${issue_output}" ]] && printf "%s\n" "${issue_output}" >&2
+        if [[ ${issue_status} -ne 0 ]]; then
+            if [[ ${CA_SERVER_EXPLICIT} -eq 0 && "${issue_output,,}" == *"pending"* && "${issue_output,,}" == *"the ca is processing your order"* ]]; then
+                print_warn "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.issue.zerossl_pending_switch")"
+                CA_SERVER='letsencrypt'
+                local new_script_config="$(jq --arg caServer "${CA_SERVER}" '.nginx.ca_server = $caServer' "${SCRIPT_CONFIG_PATH}")"
+                echo "${new_script_config}" >"${SCRIPT_CONFIG_PATH}" && sleep 2
+
+                issue_args=(
+                    --issue -d "${DOMAIN}"
+                    --webroot "${ACME_WEBROOT_PATH}"
+                    --keylength ec-256
+                    --accountkeylength ec-256
+                    --server "${CA_SERVER}"
+                )
+                issue_status=1
+                for issue_retry in 1 2 3; do
+                    issue_retry_message="$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.issue.letsencrypt_retry" | sed "s|\${attempt}|${issue_retry}|g")"
+                    print_warn "${issue_retry_message}"
+                    issue_output="$("${HOME}/.acme.sh/acme.sh" "${issue_args[@]}" 2>&1)"
+                    issue_status=$?
+                    [[ -n "${issue_output}" ]] && printf "%s\n" "${issue_output}" >&2
+                    [[ ${issue_status} -eq 0 ]] && break
+                done
+                if [[ ${issue_status} -ne 0 ]]; then
+                    mv -f "${nginx_conf_bak}" "${nginx_conf}"
+                    print_error "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.issue.letsencrypt_fail")"
+                fi
+            else
+                print_warn "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.issue.fail_first_attempt")"
+                local -a debug_issue_args=("${issue_args[@]}" --debug)
+                "${HOME}/.acme.sh/acme.sh" "${debug_issue_args[@]}"
+                mv -f "${nginx_conf_bak}" "${nginx_conf}"
+                print_error "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.issue.fail_ecc_issue")"
+            fi
+        fi
     fi
 
     # 签发成功后，恢复原始 Nginx 配置
@@ -412,10 +516,12 @@ function show_help() {
     local cmd_check_cron="$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.help.cmd_check_cron")"
     local cmd_info="$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.help.cmd_info")"
     local cmd_status="$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.help.cmd_status")"
+    local cmd_set_ca="$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.help.cmd_set_ca")"
     local cmd_help="$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.help.cmd_help")"
     local options_title="$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.help.options_title")"
     local opt_domain="$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.help.opt_domain")"
     local opt_email="$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.help.opt_email")"
+    local opt_ca="$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.help.opt_ca")"
 
     # 使用 here document 打印帮助信息
     cat <<EOF
@@ -430,10 +536,12 @@ ${commands_title}:
   --check-cron        ${cmd_check_cron}
   --info              ${cmd_info}
   --status            ${cmd_status}
+  --set-ca            ${cmd_set_ca}
   --help              ${cmd_help}
 ${options_title}:
   --domain            ${opt_domain}
   --email             ${opt_email}
+  --ca                ${opt_ca}
 EOF
     # 退出脚本，状态码为 0 (成功)
     exit 0
@@ -457,7 +565,7 @@ function main() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
         # 匹配操作命令
-        --install | --update | --purge | --issue | --renew | --stop-renew | --check-cron | --status | --info)
+        --install | --update | --purge | --issue | --renew | --stop-renew | --check-cron | --status | --info | --set-ca)
             ACTION="${1#--}" # 提取操作名称
             ;;
         # 匹配域名选项
@@ -467,6 +575,10 @@ function main() {
         # 匹配邮箱选项
         --email=*)
             ACCOUNT_EMAIL="${1#*=}" # 提取邮箱
+            ;;
+        --ca=*)
+            CA_SERVER="${1#*=}"
+            CA_SERVER_EXPLICIT=1
             ;;
         # 匹配帮助或未知选项
         --help | *)
@@ -490,6 +602,7 @@ function main() {
     check-cron) check_cron_jobs ;;         # 检查 cron
     status) check_certificate_status ;;    # 检查状态
     info) show_certificate_info ;;         # 显示信息
+    set-ca) set_default_ca ;;
     esac
 }
 
