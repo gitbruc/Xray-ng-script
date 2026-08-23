@@ -27,15 +27,6 @@ services:
     volumes:
       - /usr/local/cloudreve/aria2/config:/config
       - temp_data:/data
-  watchtower:
-    image: containrrr/watchtower
-    container_name: watchtower
-    restart: always
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    command: aria2 watchtower --cleanup --schedule "0 30 6 * * *"
-    networks:
-      - share_net
 volumes:
   temp_data:
     driver: local
