@@ -724,15 +724,32 @@ function handler_routing() {
     local rule_type="$1"                         # 获取规则类型 (block/warp)
     local rule_target="$2"                       # 获取规则目标 (ip/domain)
     local rule_tag="${rule_type}-${rule_target}" # 构造规则标签
-    # 检查 WARP 状态是否满足配置要求
-    # 如果是 warp 规则但 WARP 未启用，则报错
+    local rule_value=''
+    local rules_json=''
+
+    # WARP 规则只能在 WARP 出站已启用时添加
     if [[ "${rule_type}" == 'warp' && ${WARP_STATUS} -ne 1 ]]; then
         _error "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.warp.status")"
     fi
-    # 调用 exec_read 读取用户输入的规则值
+
+    # 重新读取当前 Xray 配置，避免使用过期的全局变量
+    XRAY_CONFIG="$(jq '.' "${XRAY_CONFIG_PATH}")" || _error "failed to read Xray config"
+
+    # exec_read 将用户输入保存到 CONFIG_DATA，而不是 XRAY_CONFIG
     exec_read "${rule_tag}"
-    # 调用 add_rule 将规则添加到 Xray 配置中
-    add_rule "${rule_tag}" "${rule_target}" "${XRAY_CONFIG[${rule_tag}]}" "${rule_type}"
+    rule_value="${CONFIG_DATA[${rule_tag}]:-}"
+    if [[ -z "${rule_value//[[:space:]]/}" ]]; then
+        _error "No value supplied for ${rule_tag}"
+    fi
+
+    # 添加/更新路由规则
+    add_rule "${rule_tag}" "${rule_target}" "${rule_value}" "${rule_type}"
+
+    # 将最新 routing.rules 同步回脚本配置，防止下次重建 Xray 时丢失手动规则。
+    # 用户已经手动维护规则，因此关闭“重置规则”模式；否则下次重建会只生成默认规则。
+    rules_json="$(printf '%s\n' "${XRAY_CONFIG}" | jq -c '.routing.rules')" || _error "failed to read updated routing rules"
+    SCRIPT_CONFIG="$(printf '%s\n' "${SCRIPT_CONFIG}" | jq --argjson rules "${rules_json}" '.rules = $rules | .xray.rules.reset = 0')" || _error "failed to update script config"
+    printf '%s\n' "${SCRIPT_CONFIG}" >"${SCRIPT_CONFIG_PATH}" || _error "failed to save script config"
 }
 
 # =============================================================================

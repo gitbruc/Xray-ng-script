@@ -277,21 +277,54 @@ function build_warp() {
 # 返回值: 容器的 IP 地址 (echo 输出)，或无输出
 # =============================================================================
 function enable_warp() {
-    # 检查名为 xray-script-warp 的容器是否已在运行
-    if ! docker ps --format "{{.Names}}" | grep -q "^xray-script-warp\$"; then
-        # 打印开始启用的信息
-        print_info "$(echo "$I18N_DATA" | jq -r '.docker.warp.enable.start')"
-        # 创建 Cloudflare WARP 容器所需的目录
-        mkdir -vp "${WARP_DIR}" >&2
-        # 使用 docker run 命令启动容器，失败则调用 print_error 退出
-        docker run -d --restart=always --name=xray-script-warp --log-driver json-file --log-opt max-size=100m --log-opt max-file=3 -v "${WARP_DIR}":/var/lib/cloudflare-warp:rw xray-script-warp >&2 || print_error "$(echo "$I18N_DATA" | jq -r '.docker.warp.build.fail')"
-        # 获取新启动容器的 IP 地址
-        local container_ip=$(get_container_ip xray-script-warp)
-        # 打印启用成功的消息，并包含容器 IP
-        print_info "$(echo "$I18N_DATA" | jq -r ".docker.warp.enable.success" | sed "s/\${container_ip}/${container_ip}/")"
-        # 输出容器 IP 地址
-        echo "${container_ip}"
+    local container_name="xray-script-warp"
+    local container_ip=""
+    local cap_add="[]"
+    local src_valid_mark=""
+
+    # 如果容器已经存在，先检查它是否具备 WARP 所需的网络管理权限。
+    # Docker 容器创建后不能通过 restart 追加 capability/sysctl；配置不符时
+    # 只删除容器本身，保留绑定挂载的 WARP_DIR，避免丢失注册信息和 WARP+ 账号。
+    if docker container inspect "${container_name}" >/dev/null 2>&1; then
+        cap_add="$(docker inspect --format '{{json .HostConfig.CapAdd}}' "${container_name}" 2>/dev/null || echo '[]')"
+        src_valid_mark="$(docker inspect --format '{{if .HostConfig.Sysctls}}{{index .HostConfig.Sysctls "net.ipv4.conf.all.src_valid_mark"}}{{end}}' "${container_name}" 2>/dev/null || true)"
+
+        if jq -e 'type == "array" and any(.[]; ascii_upcase == "NET_ADMIN")' <<<"${cap_add}" >/dev/null 2>&1 \
+            && [[ "${src_valid_mark}" == "1" ]]; then
+            # 配置已经正确：运行中的容器直接返回 IP，已停止的容器则启动。
+            if ! docker ps --format "{{.Names}}" | grep -q "^${container_name}\$"; then
+                docker start "${container_name}" >&2 || print_error "Failed to start WARP container"
+            fi
+            container_ip="$(get_container_ip "${container_name}")"
+            print_info "Cloudflare WARP container is ready: ${container_ip}"
+            echo "${container_ip}"
+            return 0
+        fi
+
+        print_warn "Recreating WARP container with NET_ADMIN and src_valid_mark; persistent WARP data will be kept."
+        docker rm -f "${container_name}" >&2 || print_error "Failed to remove old WARP container"
     fi
+
+    # 创建 Cloudflare WARP 容器所需的数据目录。
+    mkdir -vp "${WARP_DIR}" >&2
+
+    # NET_ADMIN 允许 warp-svc 安装/修复 fwmark policy routing 规则。
+    # src_valid_mark 让 IPv4 reverse-path filtering 检查考虑数据包 fwmark。
+    docker run -d \
+        --restart=always \
+        --name="${container_name}" \
+        --cap-add=NET_ADMIN \
+        --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+        --log-driver json-file \
+        --log-opt max-size=100m \
+        --log-opt max-file=3 \
+        -v "${WARP_DIR}":/var/lib/cloudflare-warp:rw \
+        xray-script-warp >&2 || print_error "$(echo "$I18N_DATA" | jq -r '.docker.warp.build.fail')"
+
+    # 获取新启动容器的 IP 地址。
+    container_ip="$(get_container_ip "${container_name}")"
+    print_info "$(echo "$I18N_DATA" | jq -r ".docker.warp.enable.success" | sed "s/\${container_ip}/${container_ip}/")"
+    echo "${container_ip}"
 }
 
 # =============================================================================
