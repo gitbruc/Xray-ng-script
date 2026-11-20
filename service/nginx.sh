@@ -63,7 +63,7 @@ readonly NGINX_LOG_PATH="/var/log/nginx" # Nginx 日志目录
 
 # --- 全局变量声明 ---
 # 声明用于存储是否启用 Brotli 模块选项、语言参数和国际化数据的全局变量
-declare IS_ENABLE_BROTLI="" # 存储用户是否选择启用 Brotli ('Y' 或 '')
+declare is_enable_brotli="" # 存储用户是否选择启用 Brotli ('Y' 或 '')
 declare LANG_PARAM=''       # (未在脚本中实际使用，可能是预留)
 declare I18N_DATA=''        # 存储从 i18n JSON 文件中读取的全部数据
 # 声明用于存储编译器优化标志的全局数组
@@ -278,6 +278,18 @@ function _version_ge() {
 }
 
 # =============================================================================
+# 函数名称: _version_gt
+# 功能描述: 比较两个版本号字符串，判断第一个是否严格大于第二个。
+# 参数:
+#   $1: 第一个版本号
+#   $2: 第二个版本号
+# 返回值: 0-第一个版本 > 第二个版本 1-否则
+# =============================================================================
+function _version_gt() {
+    [[ "$1" != "$2" ]] && _version_ge "$1" "$2"
+}
+
+# =============================================================================
 # 函数名称: _install
 # 功能描述: 根据操作系统类型安装指定的软件包。
 # 参数:
@@ -403,20 +415,22 @@ function swap_on() {
 
 # =============================================================================
 # 函数名称: backup_files
-# 功能描述: 备份指定目录下的所有文件。
+# 功能描述: 备份指定目录下的所有 .so 动态模块文件。
 # 参数:
 #   $1: 要备份的目录路径
+#   $2: 可选的日期后缀 (默认为当天 YYYY-MM-DD)
 # 返回值: 无 (执行文件备份操作)
 # =============================================================================
 function backup_files() {
-    local backup_dir="$1"            # 获取要备份的目录路径
-    local current_date="$(date +%F)" # 获取当前日期 (YYYY-MM-DD)
-    # 遍历目录中的所有文件
-    for file in "${backup_dir}/"*; do
+    local backup_dir="$1"                         # 获取要备份的目录路径
+    local current_date="${2:-$(date +%F)}"        # 获取当前日期 (YYYY-MM-DD)
+    [[ ! -d "${backup_dir}" ]] && return 0        # 目录不存在则直接返回
+    # 仅遍历目录中的 .so 文件，避免重复备份历史日期文件
+    for file in "${backup_dir}/"*.so; do
         if [[ -f "$file" ]]; then                                          # 检查是否为普通文件
             local file_name="$(basename "$file")"                          # 获取文件名
             local backup_file="${backup_dir}/${file_name}_${current_date}" # 构造备份文件名
-            mv "$file" "$backup_file"                                      # 重命名文件以进行备份
+            mv -f "$file" "$backup_file"                                   # 重命名文件以进行备份
             echo "$(echo "$I18N_DATA" | jq -r '.nginx.backup_files.backup'): ${file} -> ${backup_file}。"
         fi
     done
@@ -528,10 +542,15 @@ function gen_cflags() {
 function source_compile() {
     cd "${TMPFILE_DIR}" # 切换到临时目录
     print_info "$(echo "$I18N_DATA" | jq -r '.nginx.compile.fetch_versions')"
-    # 从 GitHub API 获取最新的 Nginx release 标签名
-    local nginx_version="$(wget -qO- --no-check-certificate https://api.github.com/repos/nginx/nginx/tags | grep 'name' | cut -d\" -f4 | grep 'release' | head -1 | sed 's/release/nginx/')"
-    # 获取最新的 OpenSSL 标签名 (格式为 openssl-x.y.z)
-    local openssl_version="openssl-$(wget -qO- --no-check-certificate https://api.github.com/repos/openssl/openssl/tags | grep 'name' | cut -d\" -f4 | grep -Eoi '^openssl-([0-9]\.?){3}$' | head -1)"
+    # 从 GitHub API 获取最新的 Nginx release 标签名 (支持多位数版本号并按语义化版本排序)
+    local nginx_version="$(wget -qO- --no-check-certificate https://api.github.com/repos/nginx/nginx/tags | grep 'name' | cut -d\" -f4 | grep -E '^release-[0-9]+\.[0-9]+\.[0-9]+$' | sort -rV | head -1 | sed 's/release/nginx/')"
+    # 获取最新的 OpenSSL 标签名 (格式为 openssl-openssl-x.y.z，以匹配 GitHub 归档解压目录名)
+    local openssl_version="openssl-$(wget -qO- --no-check-certificate https://api.github.com/repos/openssl/openssl/tags | grep 'name' | cut -d\" -f4 | grep -E '^openssl-[0-9]+\.[0-9]+\.[0-9]+$' | sort -rV | head -1)"
+
+    # 校验版本号是否成功获取
+    if [[ -z "${nginx_version}" || "${openssl_version}" == "openssl-" ]]; then
+        print_error "获取 Nginx 或 OpenSSL 最新版本号失败，请检查网络连接或 GitHub API 限流。"
+    fi
 
     # 生成编译器优化标志
     gen_cflags
@@ -603,10 +622,20 @@ function source_install() {
 # 返回值: 0-执行了更新 1-无需更新 (由 return 语句决定)
 # =============================================================================
 function source_update() {
+    # 如果未手动传 --brotli，自动检测当前 Nginx 是否已编译 Brotli 并继承该状态
+    if [[ -z "${is_enable_brotli}" ]] && cmd_exists "nginx" && nginx -V 2>&1 | grep -q "ngx_brotli"; then
+        is_enable_brotli='Y'
+        print_info "检测到当前 Nginx 已启用 ngx_brotli 模块，更新时将自动保留。"
+    fi
+
     print_info "$(echo "$I18N_DATA" | jq -r '.nginx.update.fetch_versions')"
-    # 获取最新的版本号
-    local latest_nginx_version="$(wget -qO- --no-check-certificate https://api.github.com/repos/nginx/nginx/tags | grep 'name' | cut -d\" -f4 | grep 'release' | head -1 | sed 's/release/nginx/')"
-    local latest_openssl_version="$(wget -qO- --no-check-certificate https://api.github.com/repos/openssl/openssl/tags | grep 'name' | cut -d\" -f4 | grep -Eoi '^openssl-([0-9]\.?){3}$' | head -1)"
+    # 获取最新的版本号 (支持多位数版本号并按语义化版本排序)
+    local latest_nginx_version="$(wget -qO- --no-check-certificate https://api.github.com/repos/nginx/nginx/tags | grep 'name' | cut -d\" -f4 | grep -E '^release-[0-9]+\.[0-9]+\.[0-9]+$' | sort -rV | head -1 | sed 's/release/nginx/')"
+    local latest_openssl_version="$(wget -qO- --no-check-certificate https://api.github.com/repos/openssl/openssl/tags | grep 'name' | cut -d\" -f4 | grep -E '^openssl-[0-9]+\.[0-9]+\.[0-9]+$' | sort -rV | head -1)"
+
+    if [[ -z "${latest_nginx_version}" || -z "${latest_openssl_version}" ]]; then
+        print_error "获取 Nginx 或 OpenSSL 最新版本号失败，请检查网络连接或 GitHub API 限流。"
+    fi
 
     print_info "$(echo "$I18N_DATA" | jq -r '.nginx.update.read_current_versions')"
     # 获取当前安装的 Nginx 和 OpenSSL 版本
@@ -614,38 +643,68 @@ function source_update() {
     local current_version_openssl="$(nginx -V 2>&1 | grep "^built with OpenSSL" | awk '{print $4}')"
 
     print_info "$(echo "$I18N_DATA" | jq -r '.nginx.update.check_update')"
-    # 使用 _version_ge 函数比较版本，如果任一组件有新版本则进行更新
-    if _version_ge "${latest_nginx_version#*-}" "${current_version_nginx}" || _version_ge "${latest_openssl_version#*-}" "${current_version_openssl}"; then
+    # 使用 _version_gt 函数严格比较版本，仅在任一组件存在更高版本时才进行更新
+    if _version_gt "${latest_nginx_version#*-}" "${current_version_nginx}" || _version_gt "${latest_openssl_version#*-}" "${current_version_openssl}"; then
         source_compile # 重新编译新版本
         print_info "$(echo "$I18N_DATA" | jq -r '.nginx.update.start_update')"
+
+        local current_date="$(date +%F)"
         # 备份旧的 nginx 二进制文件
-        mv "${NGINX_PATH}/sbin/nginx" "${NGINX_PATH}/sbin/nginx_$(date +%F)"
+        mv -f "${NGINX_PATH}/sbin/nginx" "${NGINX_PATH}/sbin/nginx_${current_date}"
         # 备份旧的动态模块
-        backup_files "${NGINX_PATH}/modules"
+        backup_files "${NGINX_PATH}/modules" "${current_date}"
         # 复制新编译的 nginx 二进制文件和动态模块
         cp objs/nginx "${NGINX_PATH}/sbin/"
+        mkdir -p "${NGINX_PATH}/modules"
         cp objs/*.so "${NGINX_PATH}/modules/"
         # 更新软链接
         ln -sf "${NGINX_PATH}/sbin/nginx" /usr/sbin/nginx
 
+        # 测试新版本二进制文件与当前配置的兼容性，失败则自动回滚
+        if ! "${NGINX_PATH}/sbin/nginx" -t >/dev/null 2>&1; then
+            mv -f "${NGINX_PATH}/sbin/nginx_${current_date}" "${NGINX_PATH}/sbin/nginx"
+            for bak in "${NGINX_PATH}/modules/"*.so_"${current_date}"; do
+                [[ -f "$bak" ]] && mv -f "$bak" "${bak%_${current_date}}"
+            done
+            print_error "新版 Nginx 配置校验 (nginx -t) 失败，已自动回滚到旧版本。"
+        fi
+
         # 如果 Nginx 服务正在运行，则执行平滑升级
         if systemctl is-active --quiet nginx; then
             print_info "$(echo "$I18N_DATA" | jq -r '.nginx.update.smooth_upgrade')"
-            # 启动新的 Nginx 主进程 (旧进程仍在运行)
-            kill -USR2 $(cat /run/nginx.pid)
-            # 检查旧主进程是否存在
-            if [[ -e "/run/nginx.pid.oldbin" ]]; then
-                # 优雅地关闭旧工作进程
-                kill -WINCH $(cat /run/nginx.pid.oldbin)
-                # 重新打开日志文件
-                kill -HUP $(cat /run/nginx.pid.oldbin)
-                # 优雅地退出旧主进程
-                kill -QUIT $(cat /run/nginx.pid.oldbin)
+            local old_pid=""
+            [[ -f "/run/nginx.pid" ]] && old_pid="$(cat /run/nginx.pid)"
+
+            if [[ -n "${old_pid}" ]] && kill -0 "${old_pid}" 2>/dev/null; then
+                # 启动新的 Nginx 主进程 (旧进程仍在运行)
+                kill -USR2 "${old_pid}"
+
+                # 等待最多 5 秒，确保旧主进程重命名 .oldbin 且新主进程生成新 PID 文件
+                local wait_count=0
+                while [[ ! -f "/run/nginx.pid.oldbin" || ! -f "/run/nginx.pid" || "$(cat /run/nginx.pid 2>/dev/null)" == "${old_pid}" ]] && [[ ${wait_count} -lt 25 ]]; do
+                    sleep 0.2
+                    wait_count=$((wait_count + 1))
+                done
+
+                # 检查旧主进程与新主进程是否均已就绪
+                if [[ -f "/run/nginx.pid.oldbin" && -f "/run/nginx.pid" && "$(cat /run/nginx.pid)" != "${old_pid}" ]]; then
+                    # 优雅地关闭旧工作进程
+                    kill -WINCH "${old_pid}"
+                    sleep 1
+                    # 优雅地退出旧主进程
+                    kill -QUIT "${old_pid}"
+                else
+                    print_warn "平滑升级等待新主进程超时，转为执行 systemctl restart nginx。"
+                    systemctl restart nginx
+                fi
             else
                 print_info "$(echo "$I18N_DATA" | jq -r '.nginx.update.no_old_process')"
+                systemctl restart nginx
             fi
         fi
         return 0 # 表示执行了更新
+    else
+        print_info "当前 Nginx (${current_version_nginx}) 与 OpenSSL (${current_version_openssl}) 已是最新版本，无需更新。"
     fi
     return 1 # 表示无需更新
 }
