@@ -62,7 +62,10 @@ readonly DOCKER_PATH="${SERVICE_DIR}/docker.sh" # Docker 容器管理脚本
 readonly TRAFFIC_PATH="${TOOL_DIR}/traffic.sh"  # 流量统计脚本
 readonly GEODATA_PATH="${TOOL_DIR}/geodata.sh"  # GeoData 更新脚本
 # 定义外部配置文件和脚本的路径
-readonly XRAY_CONFIG_PATH="/usr/local/etc/xray/config.json"    # Xray 最终配置文件路径
+readonly XRAY_CONFIG_DIR="/usr/local/etc/xray"                     # Xray 配置目录
+readonly XRAY_CONFIG_PATH="${XRAY_CONFIG_DIR}/config.json"         # Xray 最终配置文件路径
+readonly XRAY_DROPIN_DIR="/etc/systemd/system/xray.service.d"      # Xray systemd Drop-in 目录
+readonly XRAY_UDS_DROPIN_PATH="${XRAY_DROPIN_DIR}/20-uds-shm.conf" # Xray UDS 权限 Drop-in 配置
 readonly SCRIPT_CONFIG_PATH="${SCRIPT_CONFIG_DIR}/config.json" # 脚本主配置文件路径
 readonly ACME_PATH="${HOME}/.acme.sh/acme.sh"                  # ACME.sh 脚本路径
 
@@ -355,6 +358,39 @@ function reset_json_fields() {
 
 function persist_script_config() {
     echo "${SCRIPT_CONFIG}" >"${SCRIPT_CONFIG_PATH}" && sleep 2
+}
+
+function ensure_xray_uds_dropin() {
+    local dropin_content=''
+    dropin_content="$(printf '%s\n' \
+        '[Service]' \
+        'ExecStartPre=+/bin/mkdir -p /dev/shm/nginx' \
+        'ExecStartPre=+/bin/chmod 1777 /dev/shm/nginx' \
+        'ExecStartPre=+/bin/rm -f /dev/shm/nginx/nginx_to_xray_vision.sock /dev/shm/nginx/nginx_to_xray_vision.sock.lock /dev/shm/nginx/to_xray_xhttp.sock /dev/shm/nginx/to_xray_xhttp.sock.lock')"
+
+    mkdir -p "${XRAY_DROPIN_DIR}"
+    if [[ ! -f "${XRAY_UDS_DROPIN_PATH}" ]] || [[ "$(cat "${XRAY_UDS_DROPIN_PATH}")" != "${dropin_content}" ]]; then
+        printf '%s\n' "${dropin_content}" >"${XRAY_UDS_DROPIN_PATH}"
+        systemctl daemon-reload
+    fi
+}
+
+function fix_xray_config_permissions() {
+    [[ -d "${XRAY_CONFIG_DIR}" ]] || return 0
+    if getent group xray >/dev/null 2>&1; then
+        chown -R root:xray "${XRAY_CONFIG_DIR}"
+        chmod 750 "${XRAY_CONFIG_DIR}"
+        find "${XRAY_CONFIG_DIR}" -maxdepth 1 -type f -name '*.json' -exec chmod 640 {} +
+    elif [[ -f "${XRAY_CONFIG_PATH}" ]]; then
+        chmod 644 "${XRAY_CONFIG_PATH}"
+    fi
+}
+
+function persist_xray_config() {
+    mkdir -p "${XRAY_CONFIG_DIR}"
+    echo "${XRAY_CONFIG}" >"${XRAY_CONFIG_PATH}"
+    fix_xray_config_permissions
+    sleep 2
 }
 
 function get_custom_site_socket_name() {
@@ -703,7 +739,7 @@ function add_rule() {
         fi
     fi
     # 将更新后的 Xray 配置写入文件
-    echo "${XRAY_CONFIG}" >"${XRAY_CONFIG_PATH}" && sleep 2
+    persist_xray_config
 }
 
 # =============================================================================
@@ -1107,7 +1143,7 @@ function handler_xray_config() {
     SCRIPT_CONFIG="$(echo "${SCRIPT_CONFIG}" | jq --argjson rules "${XRAY_RULES}" '.rules = $rules')"
     # 将更新后的脚本配置和 Xray 配置写入文件
     echo "${SCRIPT_CONFIG}" >"${SCRIPT_CONFIG_PATH}" && sleep 2
-    echo "${XRAY_CONFIG}" >"${XRAY_CONFIG_PATH}" && sleep 2
+    persist_xray_config
 }
 
 # =============================================================================
@@ -1530,8 +1566,11 @@ function handler_install() {
     # 检查 Xray 命令是否存在，或是否强制安装
     if ! cmd_exists 'xray' || [[ "${force_install}" != n ]]; then
         # 调用 Xray-install 脚本进行安装
-        bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --no-update-service --version "${CONFIG_DATA['version']}"
+        bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --version "${CONFIG_DATA['version']}" || _error "xray install failed"
     fi
+    # 写入 UDS 权限 Drop-in 并修正配置目录权限
+    ensure_xray_uds_dropin
+    fix_xray_config_permissions
 }
 
 # =============================================================================
@@ -1543,6 +1582,10 @@ function handler_install() {
 function handler_purge() {
     # 调用 Xray-install 脚本进行卸载 (带 --purge 参数)
     bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove --purge
+    # 清理自定义 UDS Drop-in 配置
+    rm -f "${XRAY_UDS_DROPIN_PATH}"
+    rmdir "${XRAY_DROPIN_DIR}" 2>/dev/null || true
+    systemctl daemon-reload
     # 重置 xray 字段
     SCRIPT_CONFIG=$(reset_json_fields "${SCRIPT_CONFIG}" 'xray')
     # 将重置后的脚本配置写入文件
@@ -1560,6 +1603,9 @@ function handler_purge() {
 # 返回值: 无 (通过 systemctl 命令执行操作)
 # =============================================================================
 function handler_start() {
+    ensure_xray_uds_dropin
+    fix_xray_config_permissions
+    systemctl -q reset-failed xray 2>/dev/null || true
     # 检查 Xray 服务是否活跃，如果不活跃则启动
     systemctl -q is-active xray || systemctl -q start xray
     # 检查 Xray 服务是否已启用，如果未启用则启用
@@ -1594,6 +1640,9 @@ function handler_stop() {
 # 返回值: 无 (通过 systemctl 命令执行操作)
 # =============================================================================
 function handler_restart() {
+    ensure_xray_uds_dropin
+    fix_xray_config_permissions
+    systemctl -q reset-failed xray 2>/dev/null || true
     # 检查 Xray 服务是否活跃，如果活跃则重启，否则启动
     systemctl -q is-active xray && systemctl -q restart xray || systemctl -q start xray
     # 检查 Xray 服务是否已启用，如果未启用则启用
@@ -1718,7 +1767,7 @@ function handler_warp() {
     SCRIPT_CONFIG=$(echo "${SCRIPT_CONFIG}" | jq --arg warp "${WARP_STATUS}" '.xray.warp = $warp')
     # 将更新后的脚本配置和 Xray 配置写入文件
     echo "${SCRIPT_CONFIG}" >"${SCRIPT_CONFIG_PATH}" && sleep 2
-    echo "${XRAY_CONFIG}" >"${XRAY_CONFIG_PATH}" && sleep 2
+    persist_xray_config
 }
 
 # =============================================================================
