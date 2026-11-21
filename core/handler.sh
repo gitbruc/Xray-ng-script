@@ -1085,7 +1085,10 @@ function handler_xray_config() {
     1)
         # 重置并添加默认路由规则
         [[ "${XRAY_RULES_BT}" -eq 1 ]] && add_rule "bt" "protocol" "bittorrent" "block" 1
-        [[ "${XRAY_RULES_CN}" -eq 1 ]] && add_rule "cn-ip" "ip" "geoip:cn" "block" "after" "private-ip"
+        if [[ "${XRAY_RULES_CN}" -eq 1 ]]; then
+            add_rule "cn-domain" "domain" "geosite:cn" "block" "after" "private-ip"
+            add_rule "cn-ip" "ip" "geoip:cn" "block" "after" "cn-domain"
+        fi
         [[ "${XRAY_RULES_AD}" -eq 1 ]] && add_rule "ad-domain" "domain" "geosite:category-ads-all" "block"
         ;;
     esac
@@ -2166,6 +2169,7 @@ function handler_quick_install() {
     handler_xray_config
     # 添加默认的阻止规则
     add_rule "bt" "protocol" "bittorrent" "block" 1
+    add_rule "cn-domain" "domain" "geosite:cn" "block" "after" "private-ip"
     add_rule "cn-ip" "ip" "geoip:cn" "block" "after" "private-ip"
     add_rule "ad-domain" "domain" "geosite:category-ads-all" "block"
     # 更新 GeoData 并设置 Cron 任务 (快速模式)
