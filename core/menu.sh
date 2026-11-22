@@ -31,6 +31,11 @@ readonly YELLOW='\033[33m' # 黄色
 readonly RED='\033[31m'    # 红色
 readonly NC='\033[0m'      # 无颜色（重置）
 
+# 定义菜单选择特殊退出码，用于区分返回、直接回车默认项与非法输入
+readonly CHOOSE_BACK=0      # 返回上一级 (主菜单为退出)
+readonly CHOOSE_DEFAULT=254 # 直接回车 (触发默认选项)
+readonly CHOOSE_INVALID=255 # 非法输入
+
 # 获取当前脚本的目录、文件名（不含扩展名）和项目根目录的绝对路径
 readonly CUR_DIR="$(cd -P -- "$(dirname -- "$0")" && pwd -P)" # 当前脚本所在目录
 readonly CUR_FILE="$(basename "$0" | sed 's/\..*//')"         # 当前脚本文件名 (不含扩展名)
@@ -45,8 +50,9 @@ readonly SCRIPT_CONFIG_PATH="${SCRIPT_CONFIG_DIR}/config.json" # 脚本主要配
 
 # --- 全局变量声明 ---
 # 声明用于存储语言参数和国际化数据的全局变量
-declare LANG_PARAM='' # (未在脚本中实际使用，可能是预留)
-declare I18N_DATA=''  # 存储从 i18n JSON 文件中读取的全部数据
+declare LANG_PARAM=''    # (未在脚本中实际使用，可能是预留)
+declare CURRENT_LANG='zh' # 当前生效的语言代码
+declare I18N_DATA=''     # 存储从 i18n JSON 文件中读取的全部数据
 
 # =============================================================================
 # 函数名称: load_i18n
@@ -68,6 +74,9 @@ function load_i18n() {
         lang=$(echo "$LANG" | cut -d'_' -f1)
     fi
 
+    # 记录当前语言代码
+    CURRENT_LANG="${lang}"
+
     # 构造 i18n 文件的完整路径
     local i18n_file="${I18N_DIR}/${lang}.json"
 
@@ -88,6 +97,25 @@ function load_i18n() {
 }
 
 # =============================================================================
+# 函数名称: print_back_option
+# 功能描述: 在子菜单底部打印返回上一级选项。
+# 参数: 无 (直接使用全局变量 I18N_DATA 和 CURRENT_LANG)
+# 返回值: 无 (直接打印到标准错误输出 >&2)
+# =============================================================================
+function print_back_option() {
+    local back_text=''
+    back_text="$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.back // empty" 2>/dev/null)"
+    if [[ -z "${back_text}" ]]; then
+        if [[ "${CURRENT_LANG}" == "zh" ]]; then
+            back_text="返回上一级"
+        else
+            back_text="Back"
+        fi
+    fi
+    echo -e "${YELLOW}0.${NC} ${back_text}"
+}
+
+# =============================================================================
 # 函数名称: menu_language
 # 功能描述: 显示语言选择菜单。
 # 参数: 无
@@ -98,6 +126,9 @@ function menu_language() {
     echo -e "${GREEN}1.${NC}中文"
     # 打印英文选项
     echo -e "${GREEN}2.${NC}English"
+    # 打印分隔线和返回选项
+    echo -e "------------------------------------------------------"
+    echo -e "${YELLOW}0.${NC} 返回上一级 / Back"
 }
 
 # =============================================================================
@@ -161,6 +192,8 @@ function menu_full_installation() {
     echo -e "2. $(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.full_installation.info2")"
     # 打印分隔线
     echo -e "------------------------------------------------------"
+    # 打印返回选项
+    print_back_option
 }
 
 # =============================================================================
@@ -189,6 +222,8 @@ function menu_xray() {
     echo -e "3. $(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.xray_version.info3")"
     # 打印分隔线
     echo -e "------------------------------------------------------"
+    # 打印返回选项
+    print_back_option
 }
 
 # =============================================================================
@@ -233,6 +268,8 @@ function menu_xray_config() {
     echo -e "6. $(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.protocol_config.info6")"
     # 打印分隔线
     echo -e "------------------------------------------------------"
+    # 打印返回选项
+    print_back_option
 }
 
 # =============================================================================
@@ -259,6 +296,8 @@ function menu_web_config() {
     echo -e "3. $(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.web_config.info2")"
     # 打印分隔线
     echo -e "------------------------------------------------------"
+    # 打印返回选项
+    print_back_option
 }
 
 function menu_ca_vendor() {
@@ -269,6 +308,7 @@ function menu_ca_vendor() {
     echo -e "1. $(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.ca_vendor.info1")"
     echo -e "2. $(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.ca_vendor.info2")"
     echo -e "------------------------------------------------------"
+    print_back_option
 }
 
 # =============================================================================
@@ -307,6 +347,8 @@ function menu_config() {
     echo -e "5. $(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.config_management.info5")"
     # 打印分隔线
     echo -e "------------------------------------------------------"
+    # 打印返回选项
+    print_back_option
 }
 
 # =============================================================================
@@ -329,7 +371,7 @@ function menu_route() {
     # 打印选项 5
     echo -e "${GREEN}5.${NC} $(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.route_management.option5")"
     # 打印选项 6
-    echo -e "${GREEN}5.${NC} $(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.route_management.option6")"
+    echo -e "${GREEN}6.${NC} $(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.route_management.option6")"
 
     # 打印分隔线
     echo -e "------------------------------------------------------"
@@ -349,6 +391,8 @@ function menu_route() {
     echo -e "6. $(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.route_management.info8")"
     # 打印分隔线
     echo -e "------------------------------------------------------"
+    # 打印返回选项
+    print_back_option
 }
 
 # =============================================================================
@@ -387,6 +431,8 @@ function menu_sni_config() {
     echo -e "9. $(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.sni_config.info4")"
     # 打印分隔线
     echo -e "------------------------------------------------------"
+    # 打印返回选项
+    print_back_option
 }
 
 function menu_custom_sites() {
@@ -402,6 +448,7 @@ function menu_custom_sites() {
     echo -e "3. $(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.custom_sites.info3")"
     echo -e "4. $(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.custom_sites.info4")"
     echo -e "------------------------------------------------------"
+    print_back_option
 }
 
 # =============================================================================
@@ -466,31 +513,50 @@ function print_status() {
 # 功能描述: 提示用户输入选择，并对输入进行基本验证和处理。
 # 参数:
 #   $1: 用于区分是否是语言选择菜单的标志 (例如 '--language')
-# 返回值: 用户输入的选择数字 (通过 return 返回)
+# 返回值: 用户输入的选择数字 (通过 return 返回；0/b 返回 0，直接回车返回 254，非法输入返回 255)
 # =============================================================================
 function get_choose() {
     local i18n="$1" # 获取参数
+    local choose='' # 存储用户输入
 
     # 根据参数决定提示信息
     if [[ "$i18n" == '--language' ]]; then
-        printf "请选择你的语言(默认: 中文): " >&2
+        printf "请选择你的语言(默认: 中文, 0 返回): " >&2
     else
         # 从 i18n 数据中读取通用提示信息
         printf "${YELLOW}[$(echo "$I18N_DATA" | jq -r '.title.tip')] ${NC} $(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.choose"): " >&2
     fi
 
-    # 从标准输入读取用户输入
-    read -r choose
+    # 从标准输入读取用户输入 (EOF 时视为返回)
+    if ! read -r choose; then
+        return "${CHOOSE_BACK}"
+    fi
+
+    # 去除输入首尾空白字符
+    choose="${choose#"${choose%%[![:space:]]*}"}"
+    choose="${choose%"${choose##*[![:space:]]}"}"
+
+    # 直接回车返回默认项标识
+    if [[ -z "${choose}" ]]; then
+        return "${CHOOSE_DEFAULT}"
+    fi
+
+    # 支持 b / B 返回上一级
+    if [[ "${choose,,}" == "b" ]]; then
+        return "${CHOOSE_BACK}"
+    fi
 
     # 检查输入是否为纯数字
     if [[ ${choose} =~ ^[0-9]+$ ]]; then
-        # 移除前导零 (例如 01 -> 1)
-        choose=$(echo "${choose}" | sed 's/^0*//')
-        # 如果处理后为空 (原输入为 "0" 或 "00")，则返回 0；否则返回处理后的数字
-        return "${choose:-0}"
+        # 按十进制解析 (自动去除前导零，并防止超范围导致退出码回绕)
+        local num=$((10#${choose}))
+        if ((num > 250)); then
+            return "${CHOOSE_INVALID}"
+        fi
+        return "${num}"
     else
-        # 如果不是纯数字，则返回 0
-        return "0"
+        # 如果不是纯数字，则返回非法输入标识
+        return "${CHOOSE_INVALID}"
     fi
 }
 
@@ -533,6 +599,7 @@ function main() {
     # 如果不是显示 banner 或状态信息，则提示用户输入选择
     if [[ "$1" != "--banner" && "$1" != "--status" ]]; then
         get_choose "$1"
+        return $?
     fi
 }
 
