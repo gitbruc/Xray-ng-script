@@ -74,6 +74,7 @@ declare QUICK_INSTALL='' # 存储快速安装选项 (如 --vision, --xhttp)
 declare SCRIPT_CONFIG='' # 存储脚本配置内容
 declare LANG_PARAM=''    # 存储命令行指定的语言参数
 declare FORCE_CHECK_DEPS=0 # 是否强制检查/安装依赖 (0/1)
+declare -a ORIGINAL_ARGS=() # 保存原始启动参数，用于自动更新后重启传递
 
 # =============================================================================
 # 函数名称: _os
@@ -198,13 +199,17 @@ function load_i18n() {
     if [[ -z "${lang}" && -f "${SCRIPT_CONFIG_PATH}" ]]; then
         # 尝试从脚本配置文件中获取语言代码
         if cmd_exists "jq"; then
-            lang="$(jq -r '.language' "${SCRIPT_CONFIG_PATH}" 2>/dev/null)"
+            lang="$(jq -r '.language // empty' "${SCRIPT_CONFIG_PATH}" 2>/dev/null)"
         fi
     fi
 
-    # 如果语言设置为 "auto"，则使用系统环境变量 LANG 的第一部分作为语言代码
+    # 如果语言设置为 "auto"，则提取系统环境变量 LANG 的语言代码，C/POSIX 回退至 en
     if [[ "$lang" == "auto" ]]; then
-        lang=$(echo "$LANG" | cut -d'_' -f1)
+        lang="${LANG%%_*}"
+        lang="${lang%%.*}"
+        case "${lang}" in
+        "" | C | POSIX) lang="en" ;;
+        esac
     fi
 
     # 如果语言设置为 "en"，则加载英文提示信息
@@ -236,14 +241,17 @@ function load_i18n() {
 # 返回值: 无 (直接打印到标准错误输出 >&2，然后 exit 1)
 # =============================================================================
 function _error() {
-    # 用红色打印错误标题
-    printf "${RED}[${I18N_DATA['error']}] ${NC}"
-    # 打印传入的错误消息
-    printf -- "%s" "$@"
-    # 打印换行符
-    printf "\n"
+    # 用红色打印错误标题和消息到标准错误输出
+    printf '%b[%s]%b %s\n' "${RED}" "${I18N_DATA['error']}" "${NC}" "$*" >&2
     # 退出脚本，错误码为 1
     exit 1
+}
+
+function persist_script_config() {
+    [[ -n "${SCRIPT_CONFIG}" ]] || _error "Refusing to write empty config"
+    printf '%s\n' "${SCRIPT_CONFIG}" | jq -e '.' >/dev/null 2>&1 || _error "Refusing to write invalid JSON config"
+    local tmp_file="${SCRIPT_CONFIG_PATH}.tmp.$$"
+    printf '%s\n' "${SCRIPT_CONFIG}" >"${tmp_file}" && mv -f "${tmp_file}" "${SCRIPT_CONFIG_PATH}" && sleep 1
 }
 
 # =============================================================================
@@ -253,26 +261,27 @@ function _error() {
 # 返回值: 无 (如果不支持则调用 _error 退出)
 # =============================================================================
 function check_os() {
+    local os_ver="$(_os_ver)"
     # 检查操作系统类型和版本
     case "$(_os)" in
     # CentOS 系列
     centos)
         # 检查版本号是否大于等于 7
-        if [[ "$(_os_ver)" -lt 7 ]]; then
+        if [[ "${os_ver}" =~ ^[0-9]+$ ]] && ((10#${os_ver} < 7)); then
             _error "${I18N_DATA['centos']}"
         fi
         ;;
     # Ubuntu 系列
     ubuntu)
         # 检查版本号是否大于等于 16
-        if [[ "$(_os_ver)" -lt 16 ]]; then
+        if [[ "${os_ver}" =~ ^[0-9]+$ ]] && ((10#${os_ver} < 16)); then
             _error "${I18N_DATA['ubuntu']}"
         fi
         ;;
     # Debian 系列
     debian)
         # 检查版本号是否大于等于 9
-        if [[ "$(_os_ver)" -lt 9 ]]; then
+        if [[ "${os_ver}" =~ ^[0-9]+$ ]] && ((10#${os_ver} < 9)); then
             _error "${I18N_DATA['debian']}"
         fi
         ;;
@@ -311,7 +320,7 @@ function check_dependencies() {
         packages+=("cron" "bsdmainutils" "iproute2" "procps" "dnsutils")
         # 遍历包列表，检查是否安装
         for pkg in "${packages[@]}"; do
-            if ! dpkg -s "$pkg" &>/dev/null; then
+            if ! dpkg-query -W -f='${Status}\n' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
                 missing_packages+=("$pkg") # 如果未安装，添加到缺失列表
             fi
         done
@@ -339,31 +348,42 @@ function install_dependencies() {
         packages+=("crontabs" "util-linux" "iproute" "procps-ng" "bind-utils")
         # 检查是否使用 dnf 包管理器 (较新版本)
         if cmd_exists "dnf"; then
-            # 使用 dnf 更新系统并安装软件包
-            dnf update -y
-            dnf install -y dnf-plugins-core
-            dnf update -y
+            # 安装 EPEL 与插件仓库（qrencode/jq 等包依赖 EPEL）
+            dnf install -y epel-release dnf-plugins-core || true
+            local -a missing_pkgs=()
             for pkg in "${packages[@]}"; do
-                dnf install -y ${pkg}
+                rpm -q "$pkg" &>/dev/null || missing_pkgs+=("$pkg")
             done
+            if ((${#missing_pkgs[@]} > 0)); then
+                dnf install -y "${missing_pkgs[@]}" || for pkg in "${missing_pkgs[@]}"; do dnf install -y "${pkg}"; done
+            fi
         else
             # 使用 yum 包管理器 (较旧版本)
-            yum update -y
-            yum install -y epel-release yum-utils
-            yum update -y
+            yum install -y epel-release yum-utils || true
+            local -a missing_pkgs=()
             for pkg in "${packages[@]}"; do
-                yum install -y ${pkg}
+                rpm -q "$pkg" &>/dev/null || missing_pkgs+=("$pkg")
             done
+            if ((${#missing_pkgs[@]} > 0)); then
+                yum install -y "${missing_pkgs[@]}" || for pkg in "${missing_pkgs[@]}"; do yum install -y "${pkg}"; done
+            fi
         fi
         ;;
     ubuntu | debian)
         # 为 Debian/Ubuntu 添加系统管理工具
         packages+=("cron" "bsdmainutils" "iproute2" "procps" "dnsutils")
-        # 更新包列表并安装软件包
-        apt update -y
+        local -a missing_pkgs=()
         for pkg in "${packages[@]}"; do
-            apt install -y ${pkg}
+            if ! dpkg-query -W -f='${Status}\n' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
+                missing_pkgs+=("$pkg")
+            fi
         done
+        if ((${#missing_pkgs[@]} > 0)); then
+            apt-get update -y
+            DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing_pkgs[@]}" || for pkg in "${missing_pkgs[@]}"; do
+                DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkg}"
+            done
+        fi
         ;;
     esac
 }
@@ -379,19 +399,25 @@ function install_dependencies() {
 function download_github_files() {
     local target_dir="$1"     # 本地目标目录
     local github_api_url="$2" # GitHub API 项目 URL
+    local tmp_tar=""
 
-    # 创建目标目录
+    # 创建目标目录与临时归档文件
     mkdir -p "${target_dir}"
-    # 切换到目标目录
-    cd "${target_dir}"
+    tmp_tar="$(mktemp -t xray-script.XXXXXX.tar.gz)" || _error "${I18N_DATA['failed']}: mktemp"
 
     # 打印开始下载的信息
-    echo -e "${GREEN}[${I18N_DATA['download']}]${NC} ${github_api_url}"
-    # 使用 curl 从 GitHub API 下载 tar.gz 格式的文件，并解压
-    if ! curl -sL "${github_api_url}" | tar xz --strip-components=1; then
-        # 如果下载失败，则调用 _error 退出
+    echo -e "${GREEN}[${I18N_DATA['download']}]${NC} ${github_api_url}" >&2
+    # 先完整下载到临时文件再解压，避免半截解压污染目录且不改变脚本工作目录
+    if ! curl -fsSL --connect-timeout 15 --max-time 120 -o "${tmp_tar}" "${github_api_url}"; then
+        rm -f "${tmp_tar}"
         _error "${I18N_DATA['failed']}: ${github_api_url}"
     fi
+    if ! tar -xzf "${tmp_tar}" --strip-components=1 -C "${target_dir}"; then
+        rm -f "${tmp_tar}"
+        _error "${I18N_DATA['failed']}: ${github_api_url}"
+    fi
+    rm -f "${tmp_tar}"
+    chmod +x "${target_dir}/install.sh" "${target_dir}/core/"*.sh "${target_dir}/service/"*.sh "${target_dir}/tool/"*.sh 2>/dev/null || true
 }
 
 # =============================================================================
@@ -418,50 +444,51 @@ function download_xray_script_files() {
 # 返回值: 无 (打印版本检查信息到标准输出)
 # =============================================================================
 function check_xray_script_version() {
-    # 定义 GitHub API URL 和本地版本文件路径
+    # 定义 GitHub URL 和本地版本文件路径
     local script_config_github_url="https://raw.githubusercontent.com/gitbruc/Xray-ng-script/main/config.json"
     local is_update='n' # 初始化更新标志为 'n' (不更新)
 
     # 读取本地版本号
-    local local_version="$(jq -r '.version' "${SCRIPT_CONFIG_PATH}")"
-    # 从 GitHub API 获取远程版本号
-    local remote_version="$(curl -fsSL "$script_config_github_url" | jq -r '.version')"
+    local local_version="$(jq -r '.version // empty' "${SCRIPT_CONFIG_PATH}" 2>/dev/null)"
+    # 从 GitHub 获取远程版本号（带超时限制，网络异常时直接跳过避免误报更新）
+    local remote_version="$(curl -fsSL --connect-timeout 10 --max-time 20 "$script_config_github_url" 2>/dev/null | jq -r '.version // empty' 2>/dev/null)"
+    [[ -n "${remote_version}" && "${remote_version}" != "null" ]] || return 0
 
     # 比较本地和远程版本号
     if [[ "${local_version}" != "${remote_version}" ]]; then
         # 如果不一致，则提示用户有新版本
-        echo -e "${GREEN}[${I18N_DATA['tip']}]${NC} ${I18N_DATA['new']}"
+        echo -e "${GREEN}[${I18N_DATA['tip']}]${NC} ${I18N_DATA['new']} (${local_version} -> ${remote_version})"
         # 询问用户是否更新
-        read -rp "${I18N_DATA['now']}" -e -i "Y" is_update
+        read -rp "${I18N_DATA['now']}" -e -i "Y" is_update || is_update='n'
 
         # 根据用户选择决定是否更新
         case "${is_update,,}" in # ${is_update,,} 转换为小写
         y | yes)
             # 如果用户选择更新
-            # 切换到 HOME 目录
-            cd "${HOME}"
-            # 定义临时目录
-            readonly temp_dir="${SCRIPT_CONFIG_DIR}/xray-script-temp"
-            # 创建临时目录
+            cd "${HOME}" || true
+            # 清理并重建干净的临时目录
+            local temp_dir="${SCRIPT_CONFIG_DIR}/xray-script-temp"
+            rm -rf "${temp_dir}"
             mkdir -vp "${temp_dir}"
             # 下载最新文件到临时目录
             download_xray_script_files "${temp_dir}"
-            # 删除旧的项目目录
+            # 删除旧的项目目录并原子替换
             rm -rf "${PROJECT_ROOT}"
-            # 移动临时目录成为新项目目录
             mv -f "${temp_dir}" "${PROJECT_ROOT}"
-            # 删除旧的脚本文件
-            rm -f "${CUR_DIR}/${CUR_FILE}"
-            # 更新当前脚本文件
-            cp -f "${PROJECT_ROOT}/install.sh" "${CUR_DIR}/${CUR_FILE}"
-            # 更新版本号
-            sed -i "s|${local_version}|${remote_version}|" "${SCRIPT_CONFIG_PATH}" && sleep 1
+            # 若引导脚本位于项目目录之外且为真实 .sh 文件，同步更新该引导脚本（避免同路径自删）
+            local restart_script="${PROJECT_ROOT}/install.sh"
+            if [[ -f "${CUR_DIR}/${CUR_FILE}" && "${CUR_FILE}" == *.sh && "${CUR_DIR}/${CUR_FILE}" != "${PROJECT_ROOT}/install.sh" ]]; then
+                cp -f "${PROJECT_ROOT}/install.sh" "${CUR_DIR}/${CUR_FILE}"
+                chmod +x "${CUR_DIR}/${CUR_FILE}"
+                restart_script="${CUR_DIR}/${CUR_FILE}"
+            fi
+            # 使用 jq 原子更新配置文件中的版本号
+            SCRIPT_CONFIG="$(jq --arg v "${remote_version}" '.version = $v' "${SCRIPT_CONFIG_PATH}")"
+            persist_script_config
             # 打印更新完成信息
             echo -e "${GREEN}[${I18N_DATA['tip']}]${NC} ${I18N_DATA['completed']}"
-            # 重启脚本
-            bash "${CUR_DIR}/${CUR_FILE}"
-            # 退出脚本，避免重复执行
-            exit 0
+            # 携带原始参数重启脚本
+            exec bash "${restart_script}" "${ORIGINAL_ARGS[@]}"
             ;;
         *)
             # 如果用户选择不更新，则提示及时更新
@@ -486,6 +513,7 @@ function check_xray_script_version() {
 # 返回值: 无 (协调调用其他函数完成整个安装流程)
 # =============================================================================
 function main() {
+    ORIGINAL_ARGS=("$@")
     # 解析命令行参数
     parse_args "$@"
     # 加载国际化数据
@@ -504,23 +532,27 @@ function main() {
 
     # 仅首次运行或显式强制时检查/安装依赖
     if [[ "${is_first_run}" -eq 1 || "${FORCE_CHECK_DEPS}" -eq 1 ]]; then
-        # 检查依赖，如果缺失则安装
         if ! check_dependencies; then
             install_dependencies
         fi
-
-        # 再次检查依赖 (安装后)
         if ! check_dependencies; then
             install_dependencies
         fi
+        if ! cmd_exists 'curl' || ! cmd_exists 'jq' || ! cmd_exists 'tar'; then
+            _error "Required dependencies (curl/jq/tar) are still missing after installation"
+        fi
     fi
 
-    # 检查脚本配置目录和配置文件是否存在，如果不存在则创建并下载默认配置
-    if [[ ! -d "${SCRIPT_CONFIG_DIR}" ]]; then
-        mkdir -p "${SCRIPT_CONFIG_DIR}"
-    fi
-    if [[ ! -f "${SCRIPT_CONFIG_PATH}" ]]; then
-        wget -O "${SCRIPT_CONFIG_PATH}" https://raw.githubusercontent.com/gitbruc/Xray-ng-script/main/config.json
+    # 检查脚本配置目录和配置文件是否存在，如果不存在则原子下载并校验默认配置
+    mkdir -p "${SCRIPT_CONFIG_DIR}"
+    if [[ ! -s "${SCRIPT_CONFIG_PATH}" ]]; then
+        local config_url="https://raw.githubusercontent.com/gitbruc/Xray-ng-script/main/config.json"
+        local tmp_cfg="${SCRIPT_CONFIG_PATH}.tmp.$$"
+        if ! curl -fsSL --connect-timeout 15 --max-time 30 -o "${tmp_cfg}" "${config_url}" || ! jq -e '.' "${tmp_cfg}" >/dev/null 2>&1; then
+            rm -f "${tmp_cfg}"
+            _error "${I18N_DATA['failed']}: ${config_url}"
+        fi
+        mv -f "${tmp_cfg}" "${SCRIPT_CONFIG_PATH}"
     fi
 
     # 处理命令行参数中的快速安装和自定义目录选项
@@ -532,6 +564,7 @@ function main() {
             ;;
         # 自定义安装目录选项
         -d)
+            [[ $# -ge 2 && -n "$2" ]] || _error "Missing directory path after -d"
             shift
             PROJECT_ROOT="${1}"
             ;;
@@ -540,21 +573,19 @@ function main() {
     done
 
     # 从脚本配置文件中读取已记录的安装路径
-    local script_path="$(jq -r '.path' "${SCRIPT_CONFIG_PATH}")"
+    local script_path="$(jq -r '.path // empty' "${SCRIPT_CONFIG_PATH}")"
     # 如果配置文件中没有记录路径，且命令行也未指定，则使用默认路径
     if [[ -z "${script_path}" && -z "${PROJECT_ROOT}" ]]; then
         PROJECT_ROOT='/usr/local/xray-script' # 设置默认项目根目录
-        # 将默认路径更新到脚本配置文件中
         SCRIPT_CONFIG="$(jq --arg path "${PROJECT_ROOT}" '.path = $path' "${SCRIPT_CONFIG_PATH}")"
-        echo "${SCRIPT_CONFIG}" >"${SCRIPT_CONFIG_PATH}" && sleep 2
+        persist_script_config
     # 如果配置文件中已有记录的路径，则使用该路径
     elif [[ -n "${script_path}" ]]; then
         PROJECT_ROOT="${script_path}"
     # 如果配置文件中没有路径，但命令行指定了路径，则使用命令行指定的路径并更新配置文件
     elif [[ -n "${PROJECT_ROOT}" ]]; then
-        # 将命令行指定的路径更新到脚本配置文件中
         SCRIPT_CONFIG="$(jq --arg path "${PROJECT_ROOT}" '.path = $path' "${SCRIPT_CONFIG_PATH}")"
-        echo "${SCRIPT_CONFIG}" >"${SCRIPT_CONFIG_PATH}" && sleep 2
+        persist_script_config
     fi
 
     # 设置各个子目录的路径
@@ -574,25 +605,28 @@ function main() {
     fi
 
     # 检查配置文件中的语言设置
-    local lang="$(jq -r '.language' "${SCRIPT_CONFIG_PATH}")"
+    local lang="$(jq -r '.language // empty' "${SCRIPT_CONFIG_PATH}")"
     if [[ -z "${lang}" && -z "${LANG_PARAM}" ]]; then
         # 如果语言未设置且未通过命令行指定，则运行菜单脚本选择语言
         bash "${CORE_DIR}/menu.sh" '--language'
         case $? in
+        130) exit 130 ;;     # Ctrl+C 取消
         2) LANG_PARAM="en" ;; # 选择英文
         *) LANG_PARAM="zh" ;; # 默认中文
         esac
-        # 更新配置文件中的语言设置
         SCRIPT_CONFIG="$(jq --arg language "${LANG_PARAM}" '.language = $language' "${SCRIPT_CONFIG_PATH}")"
-        echo "${SCRIPT_CONFIG}" >"${SCRIPT_CONFIG_PATH}" && sleep 2
+        persist_script_config
     elif [[ "${LANG_PARAM}" =~ ^--lang= ]]; then
-        # 如果通过命令行指定了语言，则更新配置文件
         SCRIPT_CONFIG="$(jq --arg language "${LANG_PARAM#*=}" '.language = $language' "${SCRIPT_CONFIG_PATH}")"
-        echo "${SCRIPT_CONFIG}" >"${SCRIPT_CONFIG_PATH}" && sleep 2
+        persist_script_config
     fi
 
     # 启动主脚本，并传递快速安装选项
-    bash "${CORE_DIR}/main.sh" "${QUICK_INSTALL}"
+    if [[ -n "${QUICK_INSTALL}" ]]; then
+        bash "${CORE_DIR}/main.sh" "${QUICK_INSTALL}"
+    else
+        bash "${CORE_DIR}/main.sh"
+    fi
 }
 
 # --- 脚本执行入口 ---

@@ -5,7 +5,7 @@
 # Xray-script:
 #   https://github.com/zxcvos/Xray-script
 # =============================================================================
-# 注释: 通过 Qwen3-Coder 生成。
+# 注释: 通过 Gemini-Neon 生成。
 # 脚本名称: read.sh
 # 功能描述: 根据传入的参数，从国际化 (i18n) 配置文件中读取对应的提示信息，
 #           并从标准输入读取用户输入，返回用户输入的内容。
@@ -61,11 +61,19 @@ declare I18N_DATA=''  # 存储从 i18n JSON 文件中读取的全部数据
 # =============================================================================
 function load_i18n() {
     # 从配置文件中读取语言设置
-    local lang="$(jq -r '.language' "${SCRIPT_CONFIG_PATH}")"
+    local lang=""
+    if [[ -f "${SCRIPT_CONFIG_PATH}" ]]; then
+        lang="$(jq -r '.language // "auto"' "${SCRIPT_CONFIG_PATH}" 2>/dev/null)"
+    fi
+    [[ -z "${lang}" || "${lang}" == "null" ]] && lang="auto"
 
     # 如果语言设置为 "auto"，则使用系统环境变量 LANG 的第一部分作为语言代码
     if [[ "$lang" == "auto" ]]; then
-        lang=$(echo "$LANG" | cut -d'_' -f1)
+        lang="${LANG%%_*}"
+        lang="${lang%%.*}"
+        case "${lang}" in
+        "" | C | POSIX) lang="en" ;;
+        esac
     fi
 
     # 构造 i18n 文件的完整路径
@@ -116,7 +124,7 @@ function read_input() {
     fi
 
     # 使用指定颜色和标题打印提示信息到标准错误输出
-    printf "${color}[${title}]${NC} ${msg} " >&2
+    printf '%b[%s]%b %s ' "${color}" "${title}" "${NC}" "${msg}" >&2
 }
 
 # --- 参数映射表 ---
@@ -178,31 +186,30 @@ function main() {
     fi
 
     # 检查传入的参数是否存在于参数映射表中，如果不存在则直接返回
-    [[ -z "${param_map[$option]}" ]] && return
+    [[ -z "${option}" || -z "${param_map[$option]:-}" ]] && return 1
 
     # 使用 IFS (Internal Field Separator) 将映射表中的值分割为 type 和 field
     IFS=',' read -r type field <<<"${param_map[$option]}"
 
-    # 构造 i18n 文件中的键名 (例如: read.port, read.uuid)
-    local key="${CUR_FILE}.${field}"
-
-    # 从 i18n 数据中读取该键对应的提示文本
+    # 从 i18n 数据中读取该键对应的提示文本 (例如: read.port, read.uuid)
     local prompt=""
-    prompt="$(echo "$I18N_DATA" | jq -r ".$key")"
+    prompt="$(echo "$I18N_DATA" | jq -r --arg file "${CUR_FILE}" --arg field "${field}" '.[$file][$field] // empty')"
 
     # 对于 --short 参数，额外打印一条关于 Short ID 格式的提示
     if [[ "${option}" == "--short" ]]; then
-        echo -e "${YELLOW}[$(echo "$I18N_DATA" | jq -r '.title.tip')]${NC} $(echo "$I18N_DATA" | jq -r '.read.short_id_tip')" >&2
+        printf '%b[%s]%b %s\n' "${YELLOW}" "$(echo "$I18N_DATA" | jq -r '.title.tip')" "${NC}" "$(echo "$I18N_DATA" | jq -r '.read.short_id_tip')" >&2
     fi
 
     # 调用 read_input 函数显示提示信息
     read_input "$type" "$prompt"
 
-    # 从标准输入读取一行用户输入
-    read -r input
+    # 从标准输入读取一行用户输入，并兼容 CRLF 终端输入
+    local input=""
+    IFS= read -r input || true
+    input="${input%$'\r'}"
 
     # 输出用户输入的内容
-    echo "$input"
+    printf '%s\n' "$input"
 }
 
 # --- 脚本执行入口 ---

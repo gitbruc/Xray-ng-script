@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# 注释: 通过 Qwen3-Coder 生成。
+# 注释: 通过 Gemini-Neon 生成。
 # 脚本名称: ssl.sh
 # 脚本仓库: https://github.com/zxcvos/Xray-script
 # 功能描述: 使用 acme.sh 管理 SSL 证书的脚本。
@@ -74,11 +74,19 @@ declare I18N_DATA=''     # 存储从 i18n JSON 文件中读取的全部数据
 # =============================================================================
 function load_i18n() {
     # 从配置文件中读取语言设置
-    local lang="$(jq -r '.language' "${SCRIPT_CONFIG_PATH}")"
+    local lang=""
+    if [[ -f "${SCRIPT_CONFIG_PATH}" ]]; then
+        lang="$(jq -r '.language // "auto"' "${SCRIPT_CONFIG_PATH}" 2>/dev/null)"
+    fi
+    [[ -z "${lang}" || "${lang}" == "null" ]] && lang="auto"
 
     # 如果语言设置为 "auto"，则使用系统环境变量 LANG 的第一部分作为语言代码
     if [[ "$lang" == "auto" ]]; then
-        lang=$(echo "$LANG" | cut -d'_' -f1)
+        lang="${LANG%%_*}"
+        lang="${lang%%.*}"
+        case "${lang}" in
+        "" | C | POSIX) lang="en" ;;
+        esac
     fi
 
     # 构造 i18n 文件的完整路径
@@ -109,7 +117,9 @@ function load_i18n() {
 # =============================================================================
 function print_info() {
     # 从 i18n 数据中读取 "信息" 标题，然后用绿色打印消息
-    printf "${GREEN}[$(echo "$I18N_DATA" | jq -r '.title.info')] ${NC}%s\n" "$*" >&2
+    local title="Info"
+    [[ -n "${I18N_DATA}" ]] && title="$(echo "$I18N_DATA" | jq -r '.title.info // "Info"')"
+    printf '%b[%s]%b %s\n' "${GREEN}" "${title}" "${NC}" "$*" >&2
 }
 
 # =============================================================================
@@ -121,7 +131,9 @@ function print_info() {
 # =============================================================================
 function print_warn() {
     # 从 i18n 数据中读取 "警告" 标题，然后用黄色打印消息
-    printf "${YELLOW}[$(echo "$I18N_DATA" | jq -r '.title.warn')] ${NC}%s\n" "$*" >&2
+    local title="Warn"
+    [[ -n "${I18N_DATA}" ]] && title="$(echo "$I18N_DATA" | jq -r '.title.warn // "Warn"')"
+    printf '%b[%s]%b %s\n' "${YELLOW}" "${title}" "${NC}" "$*" >&2
 }
 
 # =============================================================================
@@ -133,9 +145,15 @@ function print_warn() {
 # =============================================================================
 function print_error() {
     # 从 i18n 数据中读取 "错误" 标题，然后用红色打印消息
-    printf "${RED}[$(echo "$I18N_DATA" | jq -r '.title.error')] ${NC}%s\n" "$*" >&2
+    local title="Error"
+    [[ -n "${I18N_DATA}" ]] && title="$(echo "$I18N_DATA" | jq -r '.title.error // "Error"')"
+    printf '%b[%s]%b %s\n' "${RED}" "${title}" "${NC}" "$*" >&2
     # 打印错误信息后退出脚本，错误码为 1
     exit 1
+}
+
+function ensure_acme_installed() {
+    [[ -x "${HOME}/.acme.sh/acme.sh" ]] || print_error "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.set_ca.not_installed // \"acme.sh is not installed\"")"
 }
 
 # =============================================================================
@@ -163,7 +181,8 @@ function normalize_ca_server() {
 # 返回值: 标准化后的 CA 名称
 # =============================================================================
 function get_config_ca_server() {
-    local config_ca_server="$(jq -r '.nginx.ca_server' "${SCRIPT_CONFIG_PATH}")"
+    local config_ca_server=""
+    [[ -f "${SCRIPT_CONFIG_PATH}" ]] && config_ca_server="$(jq -r '.nginx.ca_server // empty' "${SCRIPT_CONFIG_PATH}" 2>/dev/null)"
     normalize_ca_server "${config_ca_server}"
 }
 
@@ -209,8 +228,15 @@ function install_acme_sh() {
     print_info "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.install.start")"
     resolve_ca_server
 
-    # 使用 curl 下载并运行 acme.sh 安装脚本，设置账户邮箱
-    curl https://get.acme.sh | sh -s email="${ACCOUNT_EMAIL}" || print_error "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.install.fail_download")"
+    # 使用 curl 带超时和状态码检查下载 acme.sh 安装脚本，再执行安装
+    local acme_installer=""
+    acme_installer="$(curl -fsSL --connect-timeout 15 --max-time 60 https://get.acme.sh)" || print_error "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.install.fail_download")"
+    [[ -n "${acme_installer}" ]] || print_error "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.install.fail_download")"
+    if [[ -n "${ACCOUNT_EMAIL}" ]]; then
+        printf '%s\n' "${acme_installer}" | sh -s email="${ACCOUNT_EMAIL}" || print_error "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.install.fail_download")"
+    else
+        printf '%s\n' "${acme_installer}" | sh || print_error "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.install.fail_download")"
+    fi
 
     # 启用 acme.sh 的自动升级功能
     "${HOME}/.acme.sh/acme.sh" --upgrade --auto-upgrade || print_error "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.install.fail_autoupgrade")"
@@ -225,6 +251,7 @@ function install_acme_sh() {
 # 返回值: 无 (更新成功或失败后退出)
 # =============================================================================
 function update_acme_sh() {
+    ensure_acme_installed
     # 打印更新信息
     print_info "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.update.start")"
 
@@ -263,6 +290,8 @@ function purge_acme_sh() {
 # 返回值: 无 (签发成功或失败后退出)
 # =============================================================================
 function issue_certificate() {
+    ensure_acme_installed
+
     # 检查是否提供了域名
     if [[ ${#DOMAIN} -eq 0 ]]; then
         print_error "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.issue.no_domain")"
@@ -283,10 +312,26 @@ function issue_certificate() {
     # 定义 Nginx 配置文件及其备份路径
     local nginx_conf="${NGINX_CONFIG_PATH}/nginx.conf"
     local nginx_conf_bak="${nginx_conf}.ssl_script.bak"
+    local nginx_conf_backed_up=0
 
-    # 如果原 Nginx 配置文件存在，则备份
+    restore_nginx_conf() {
+        if [[ ${nginx_conf_backed_up} -eq 1 && -f "${nginx_conf_bak}" ]]; then
+            mv -f "${nginx_conf_bak}" "${nginx_conf}"
+            nginx_conf_backed_up=0
+        fi
+    }
+
+    # 如果原 Nginx 配置文件存在，则备份并注册异常退出自动还原
     if [[ -f "${nginx_conf}" ]]; then
         cp -f "${nginx_conf}" "${nginx_conf_bak}" || print_error "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.issue.fail_backup_nginx" | sed "s|\${nginx_conf}|${nginx_conf}|")"
+        nginx_conf_backed_up=1
+        trap 'restore_nginx_conf' EXIT INT TERM
+    fi
+
+    # 仅在系统启用 IPv6 协议栈时添加 IPv6 80 端口监听，防止双栈域名 AAAA 验证失败
+    local ipv6_listen_line=""
+    if [[ -f /proc/net/if_inet6 ]]; then
+        ipv6_listen_line="        listen       [::]:80;"
     fi
 
     # 生成一个临时的 Nginx 配置文件，用于 ACME HTTP-01 验证
@@ -304,6 +349,7 @@ http {
     keepalive_timeout  65;
     server {
         listen       80;
+${ipv6_listen_line}
         location ^~ /.well-known/acme-challenge/ {
             root ${ACME_WEBROOT_PATH};
         }
@@ -338,6 +384,16 @@ EOF
         issue_args+=(--force)
     fi
 
+    # acme.sh 返回 2 表示证书仍在有效期内且域名未变更（Skip），此时直接视为成功继续安装证书
+    is_acme_issue_ok() {
+        local rc="$1"
+        [[ ${rc} -eq 0 ]] && return 0
+        if [[ ${rc} -eq 2 && -s "${HOME}/.acme.sh/${DOMAIN}_ecc/fullchain.cer" ]]; then
+            return 0
+        fi
+        return 1
+    }
+
     if [[ "${CA_SERVER}" == 'letsencrypt' ]]; then
         issue_status=1
         for issue_retry in 1 2 3; do
@@ -346,22 +402,27 @@ EOF
             issue_output="$("${HOME}/.acme.sh/acme.sh" "${issue_args[@]}" 2>&1)"
             issue_status=$?
             [[ -n "${issue_output}" ]] && printf "%s\n" "${issue_output}" >&2
-            [[ ${issue_status} -eq 0 ]] && break
+            is_acme_issue_ok "${issue_status}" && { issue_status=0; break; }
+            sleep 2
         done
         if [[ ${issue_status} -ne 0 ]]; then
-            mv -f "${nginx_conf_bak}" "${nginx_conf}"
+            restore_nginx_conf
             print_error "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.issue.letsencrypt_fail")"
         fi
     else
         issue_output="$("${HOME}/.acme.sh/acme.sh" "${issue_args[@]}" 2>&1)"
         issue_status=$?
         [[ -n "${issue_output}" ]] && printf "%s\n" "${issue_output}" >&2
-        if [[ ${issue_status} -ne 0 ]]; then
+        if ! is_acme_issue_ok "${issue_status}"; then
             if [[ ${CA_SERVER_EXPLICIT} -eq 0 && "${issue_output,,}" == *"pending"* && "${issue_output,,}" == *"the ca is processing your order"* ]]; then
                 print_warn "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.issue.zerossl_pending_switch")"
                 CA_SERVER='letsencrypt'
-                local new_script_config="$(jq --arg caServer "${CA_SERVER}" '.nginx.ca_server = $caServer' "${SCRIPT_CONFIG_PATH}")"
-                echo "${new_script_config}" >"${SCRIPT_CONFIG_PATH}" && sleep 2
+                local new_script_config=""
+                if [[ -f "${SCRIPT_CONFIG_PATH}" ]] && new_script_config="$(jq --arg caServer "${CA_SERVER}" '.nginx.ca_server = $caServer' "${SCRIPT_CONFIG_PATH}")" && [[ -n "${new_script_config}" ]]; then
+                    local tmp_cfg="${SCRIPT_CONFIG_PATH}.tmp.$$"
+                    printf '%s\n' "${new_script_config}" >"${tmp_cfg}" && mv -f "${tmp_cfg}" "${SCRIPT_CONFIG_PATH}" && sleep 2
+                fi
+                "${HOME}/.acme.sh/acme.sh" --set-default-ca --server "${CA_SERVER}" >/dev/null 2>&1 || true
 
                 issue_args=(
                     --issue -d "${DOMAIN}"
@@ -377,30 +438,35 @@ EOF
                     issue_output="$("${HOME}/.acme.sh/acme.sh" "${issue_args[@]}" 2>&1)"
                     issue_status=$?
                     [[ -n "${issue_output}" ]] && printf "%s\n" "${issue_output}" >&2
-                    [[ ${issue_status} -eq 0 ]] && break
+                    is_acme_issue_ok "${issue_status}" && { issue_status=0; break; }
+                    sleep 2
                 done
                 if [[ ${issue_status} -ne 0 ]]; then
-                    mv -f "${nginx_conf_bak}" "${nginx_conf}"
+                    restore_nginx_conf
                     print_error "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.issue.letsencrypt_fail")"
                 fi
             else
                 print_warn "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.issue.fail_first_attempt")"
                 local -a debug_issue_args=("${issue_args[@]}" --debug)
                 "${HOME}/.acme.sh/acme.sh" "${debug_issue_args[@]}"
-                mv -f "${nginx_conf_bak}" "${nginx_conf}"
-                print_error "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.issue.fail_ecc_issue")"
+                issue_status=$?
+                if ! is_acme_issue_ok "${issue_status}"; then
+                    restore_nginx_conf
+                    print_error "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.issue.fail_ecc_issue")"
+                fi
             fi
         fi
     fi
 
-    # 签发成功后，恢复原始 Nginx 配置
-    mv -f "${nginx_conf_bak}" "${nginx_conf}"
+    # 签发成功后，恢复原始 Nginx 配置并解除 trap
+    restore_nginx_conf
+    trap - EXIT INT TERM
 
     # 安装签发的证书到指定路径，并设置 Nginx 重载命令
-    "${HOME}/.acme.sh/acme.sh" --install-cert --ecc -d ${DOMAIN} \
+    "${HOME}/.acme.sh/acme.sh" --install-cert --ecc -d "${DOMAIN}" \
         --key-file "${cert_path}/privkey.pem" \
         --fullchain-file "${cert_path}/fullchain.pem" \
-        --reloadcmd "nginx -t && systemctl reload nginx" || print_error "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.issue.fail_install_cert")"
+        --reloadcmd "nginx -t && (systemctl is-active --quiet nginx && systemctl reload nginx || systemctl start nginx)" || print_error "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.issue.fail_install_cert")"
 }
 
 # =============================================================================
@@ -410,6 +476,7 @@ EOF
 # 返回值: 无 (续期成功或失败后退出)
 # =============================================================================
 function renew_certificates() {
+    ensure_acme_installed
     # 打印续期信息
     print_info "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.renew.start")"
 
@@ -429,12 +496,14 @@ function stop_renew_certificates() {
 
     # 检查是否提供了域名
     if [[ ${#DOMAIN} -gt 0 ]]; then
-        # 执行 acme.sh 的移除命令（停止续期）
-        "${HOME}/.acme.sh/acme.sh" --remove -d ${DOMAIN} --ecc || print_warn "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.stop_renew.fail_cmd")"
+        if [[ -x "${HOME}/.acme.sh/acme.sh" ]]; then
+            # 执行 acme.sh 的移除命令（停止续期）
+            "${HOME}/.acme.sh/acme.sh" --remove -d "${DOMAIN}" --ecc || print_warn "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.stop_renew.fail_cmd")"
+        fi
         # 删除该域名的 acme.sh 本地存储目录
-        rm -rf "${HOME}/.acme.sh/${DOMAIN}_ecc" # 更健壮的路径处理
+        rm -rf "${HOME}/.acme.sh/${DOMAIN}_ecc"
         # 删除该域名的本地证书目录
-        rm -rf "${NGINX_CONFIG_PATH}/certs/${DOMAIN}" # 更健壮的路径处理
+        rm -rf "${NGINX_CONFIG_PATH}/certs/${DOMAIN}"
     else
         # 如果未提供域名，则打印警告
         print_warn "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.stop_renew.no_domain")"
@@ -448,6 +517,7 @@ function stop_renew_certificates() {
 # 返回值: 无 (打印检查信息)
 # =============================================================================
 function check_cron_jobs() {
+    ensure_acme_installed
     # 打印检查信息
     print_info "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.check_cron.start")"
 
@@ -466,16 +536,11 @@ function check_certificate_status() {
     if [[ ${#DOMAIN} -eq 0 ]]; then
         print_error "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.status.no_domain")"
     fi
+    [[ -x "${HOME}/.acme.sh/acme.sh" ]] || return 1
 
-    # 从 acme.sh 列表中查找匹配的域名
-    local main_domain=$(
-        "${HOME}/.acme.sh/acme.sh" --list --home "${HOME}/.acme.sh" |
-            grep -E "^${DOMAIN}" |
-            awk '{print $1}'
-    )
-
-    # 比较找到的域名与提供的域名
-    [[ "${main_domain}" == "${DOMAIN}" ]]
+    # 精确匹配第一列主域名，避免前缀子串（如 a.com 与 a.com.cn）及点号通配误判
+    "${HOME}/.acme.sh/acme.sh" --list --home "${HOME}/.acme.sh" 2>/dev/null |
+        awk -v target="${DOMAIN}" 'NR > 1 && $1 == target { found=1; exit } END { exit !found }'
 }
 
 # =============================================================================
@@ -485,6 +550,7 @@ function check_certificate_status() {
 # 返回值: 无 (打印证书信息)
 # =============================================================================
 function show_certificate_info() {
+    ensure_acme_installed
     # 检查是否提供了域名
     if [[ ${#DOMAIN} -eq 0 ]]; then
         print_error "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.info.no_domain")"
@@ -493,8 +559,12 @@ function show_certificate_info() {
     # 打印显示信息
     print_info "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.info.start")"
 
-    # 执行 acme.sh 的信息显示命令
-    "${HOME}/.acme.sh/acme.sh" --info -d ${DOMAIN}
+    # 优先查询 ECC 证书信息（与签发时的 --keylength ec-256 保持一致），未命中再回退 RSA
+    if [[ -d "${HOME}/.acme.sh/${DOMAIN}_ecc" ]]; then
+        "${HOME}/.acme.sh/acme.sh" --info -d "${DOMAIN}" --ecc
+    else
+        "${HOME}/.acme.sh/acme.sh" --info -d "${DOMAIN}"
+    fi
 }
 
 # =============================================================================
@@ -580,9 +650,13 @@ function main() {
             CA_SERVER="${1#*=}"
             CA_SERVER_EXPLICIT=1
             ;;
-        # 匹配帮助或未知选项
-        --help | *)
+        # 匹配帮助选项
+        --help)
             show_help # 显示帮助并退出
+            ;;
+        # 未知选项报错退出
+        *)
+            print_error "Unsupported option: $1"
             ;;
         esac
         shift # 移动到下一个参数

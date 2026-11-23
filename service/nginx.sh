@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# 注释: 通过 Qwen3-Coder 生成。
+# 注释: 通过 Gemini-Neon 生成。
 # 脚本名称: nginx.sh
 # 脚本仓库: https://github.com/zxcvos/Xray-script
 # 功能描述: 用于从源代码编译、安装、更新和卸载 Nginx 的脚本。
@@ -77,10 +77,12 @@ declare -a cflags=() # 存储 GCC 编译优化选项
 # 返回值: 无 (直接执行清理命令)
 # =============================================================================
 function egress() {
-    # 如果 swap 文件存在，则关闭 swap
-    [[ -e "${TMPFILE_DIR}/swap" ]] && swapoff "${TMPFILE_DIR}/swap"
+    local exit_code=$?
+    # 如果 swap 文件存在，则关闭 swap（忽略未挂载时的报错）
+    [[ -e "${TMPFILE_DIR}/swap" ]] && swapoff "${TMPFILE_DIR}/swap" 2>/dev/null || true
     # 删除临时工作目录
     rm -rf "${TMPFILE_DIR}"
+    return "${exit_code}"
 }
 
 # =============================================================================
@@ -96,11 +98,19 @@ function egress() {
 # =============================================================================
 function load_i18n() {
     # 从配置文件中读取语言设置
-    local lang="$(jq -r '.language' "${SCRIPT_CONFIG_PATH}")"
+    local lang=""
+    if [[ -f "${SCRIPT_CONFIG_PATH}" ]]; then
+        lang="$(jq -r '.language // "auto"' "${SCRIPT_CONFIG_PATH}" 2>/dev/null)"
+    fi
+    [[ -z "${lang}" || "${lang}" == "null" ]] && lang="auto"
 
     # 如果语言设置为 "auto"，则使用系统环境变量 LANG 的第一部分作为语言代码
     if [[ "$lang" == "auto" ]]; then
-        lang=$(echo "$LANG" | cut -d'_' -f1)
+        lang="${LANG%%_*}"
+        lang="${lang%%.*}"
+        case "${lang}" in
+        "" | C | POSIX) lang="en" ;;
+        esac
     fi
 
     # 构造 i18n 文件的完整路径
@@ -131,7 +141,9 @@ function load_i18n() {
 # =============================================================================
 function print_info() {
     # 从 i18n 数据中读取 "信息" 标题，然后用绿色打印消息
-    printf "${GREEN}[$(echo "$I18N_DATA" | jq -r '.title.info')] ${NC}%s\n" "$*" >&2
+    local title="Info"
+    [[ -n "${I18N_DATA}" ]] && title="$(echo "$I18N_DATA" | jq -r '.title.info // "Info"')"
+    printf '%b[%s]%b %s\n' "${GREEN}" "${title}" "${NC}" "$*" >&2
 }
 
 # =============================================================================
@@ -143,7 +155,9 @@ function print_info() {
 # =============================================================================
 function print_warn() {
     # 从 i18n 数据中读取 "警告" 标题，然后用黄色打印消息
-    printf "${YELLOW}[$(echo "$I18N_DATA" | jq -r '.title.warn')] ${NC}%s\n" "$*" >&2
+    local title="Warn"
+    [[ -n "${I18N_DATA}" ]] && title="$(echo "$I18N_DATA" | jq -r '.title.warn // "Warn"')"
+    printf '%b[%s]%b %s\n' "${YELLOW}" "${title}" "${NC}" "$*" >&2
 }
 
 # =============================================================================
@@ -155,7 +169,9 @@ function print_warn() {
 # =============================================================================
 function print_error() {
     # 从 i18n 数据中读取 "错误" 标题，然后用红色打印消息
-    printf "${RED}[$(echo "$I18N_DATA" | jq -r '.title.error')] ${NC}%s\n" "$*" >&2
+    local title="Error"
+    [[ -n "${I18N_DATA}" ]] && title="$(echo "$I18N_DATA" | jq -r '.title.error // "Error"')"
+    printf '%b[%s]%b %s\n' "${RED}" "${title}" "${NC}" "$*" >&2
     # 打印错误信息后退出脚本，错误码为 1
     exit 1
 }
@@ -254,13 +270,26 @@ function _os_ver() {
 #   $1: 要执行的命令字符串
 # 返回值: 无 (执行成功或失败后退出)
 # =============================================================================
+function replace_placeholder() {
+    local text="$1"
+    local placeholder="$2"
+    local replacement="$3"
+    local out=""
+    while [[ "${text}" == *"${placeholder}"* ]]; do
+        out+="${text%%"${placeholder}"*}${replacement}"
+        text="${text#*"${placeholder}"}"
+    done
+    printf '%s' "${out}${text}"
+}
+
 function _error_detect() {
-    local cmd="$1"                                                                                 # 获取要执行的命令
-    print_info "$(echo "$I18N_DATA" | jq -r '.nginx.compile.executing' | sed "s|\${cmd}|${cmd}|")" # 打印将要执行的命令
-    eval "${cmd}"                                                                                  # 执行命令
-    # 检查命令执行的退出状态
+    local cmd="$1" # 获取要执行的命令
+    local exec_tpl="$(echo "$I18N_DATA" | jq -r '.nginx.compile.executing')"
+    print_info "$(replace_placeholder "${exec_tpl}" '${cmd}' "${cmd}")"
+    eval "${cmd}"
     if [[ $? -ne 0 ]]; then
-        print_error "$(echo "$I18N_DATA" | jq -r '.nginx.compile.fail_exec_cmd' | sed "s|\${cmd}|${cmd}|")" # 如果失败则打印错误并退出
+        local fail_tpl="$(echo "$I18N_DATA" | jq -r '.nginx.compile.fail_exec_cmd')"
+        print_error "$(replace_placeholder "${fail_tpl}" '${cmd}' "${cmd}")"
     fi
 }
 
@@ -352,13 +381,16 @@ function _install() {
         ;;
     # 处理 Debian 和 Ubuntu 系统
     ubuntu | debian)
-        apt update -y                                            # 更新包列表
-        installed_packages="$(apt list --installed 2>/dev/null)" # 获取已安装包列表
+        local -a missing_pkgs=()
         for package_name in ${packages_name}; do
-            if ! echo "${installed_packages}" | grep -iwq "${package_name}"; then
-                _error_detect "apt install -y "${package_name}""
+            if ! dpkg-query -W -f='${Status}\n' "${package_name}" 2>/dev/null | grep -q "install ok installed"; then
+                missing_pkgs+=("${package_name}")
             fi
         done
+        if ((${#missing_pkgs[@]} > 0)); then
+            _error_detect "apt-get update -y"
+            _error_detect "DEBIAN_FRONTEND=noninteractive apt-get install -y ${missing_pkgs[*]}"
+        fi
         ;;
     esac
 }
@@ -402,13 +434,14 @@ function check_os() {
 # 返回值: 无 (执行 swap 文件创建和启用)
 # =============================================================================
 function swap_on() {
-    local mem=${1}                # 获取请求的 swap 大小 (MB)
-    if [[ ${mem} -ne '0' ]]; then # 如果大小不为 0
-        # 使用 dd 创建 swap 文件
-        if dd if=/dev/zero of="${TMPFILE_DIR}/swap" bs=1M count=${mem} 2>&1; then
-            chmod 0600 "${TMPFILE_DIR}/swap" # 设置文件权限
-            mkswap "${TMPFILE_DIR}/swap"     # 格式化为 swap
-            swapon "${TMPFILE_DIR}/swap"     # 启用 swap
+    local mem="${1:-0}"
+    if [[ "${mem}" =~ ^[0-9]+$ ]] && ((mem > 0)); then
+        if dd if=/dev/zero of="${TMPFILE_DIR}/swap" bs=1M count="${mem}" status=none 2>/dev/null; then
+            chmod 0600 "${TMPFILE_DIR}/swap"
+            if ! (mkswap "${TMPFILE_DIR}/swap" >/dev/null 2>&1 && swapon "${TMPFILE_DIR}/swap" 2>/dev/null); then
+                rm -f "${TMPFILE_DIR}/swap"
+                print_warn "当前虚拟化环境不支持挂载临时 swap，已跳过并继续编译。"
+            fi
         fi
     fi
 }
@@ -474,61 +507,54 @@ function compile_dependencies() {
 function gen_cflags() {
     # 初始化 cflags 数组，包含基本优化
     cflags=('-g0' '-O3') # -g0: 不生成调试信息; -O3: 最高级别优化
-    # 检查 GCC 是否支持特定标志，如果支持则添加到 cflags 数组中
-    # 这些检查旨在移除可能导致性能下降或不必要的安全特性
-    if gcc -v --help 2>&1 | grep -qw "\\-fstack\\-reuse"; then
+    # 缓存一次 gcc 帮助输出，避免重复调用 15 次外部进程
+    local gcc_help="$(gcc -v --help 2>&1)"
+    if grep -qw -- '-fstack-reuse' <<<"${gcc_help}"; then
         cflags+=('-fstack-reuse=all')
     fi
-    if gcc -v --help 2>&1 | grep -qw "\\-fdwarf2\\-cfi\\-asm"; then
+    if grep -qw -- '-fdwarf2-cfi-asm' <<<"${gcc_help}"; then
         cflags+=('-fdwarf2-cfi-asm')
     fi
-    if gcc -v --help 2>&1 | grep -qw "\\-fplt"; then
+    if grep -qw -- '-fplt' <<<"${gcc_help}"; then
         cflags+=('-fplt')
     fi
-    if gcc -v --help 2>&1 | grep -qw "\\-ftrapv"; then
+    if grep -qw -- '-ftrapv' <<<"${gcc_help}"; then
         cflags+=('-fno-trapv')
     fi
-    # 异常处理相关
-    if gcc -v --help 2>&1 | grep -qw "\\-fexceptions"; then
+    if grep -qw -- '-fexceptions' <<<"${gcc_help}"; then
         cflags+=('-fno-exceptions')
-    elif gcc -v --help 2>&1 | grep -qw "\\-fhandle\\-exceptions"; then
+    elif grep -qw -- '-fhandle-exceptions' <<<"${gcc_help}"; then
         cflags+=('-fno-handle-exceptions')
     fi
-    # unwind 表相关
-    if gcc -v --help 2>&1 | grep -qw "\\-funwind\\-tables"; then
+    if grep -qw -- '-funwind-tables' <<<"${gcc_help}"; then
         cflags+=('-fno-unwind-tables')
     fi
-    if gcc -v --help 2>&1 | grep -qw "\\-fasynchronous\\-unwind\\-tables"; then
+    if grep -qw -- '-fasynchronous-unwind-tables' <<<"${gcc_help}"; then
         cflags+=('-fno-asynchronous-unwind-tables')
     fi
-    # 栈检查相关
-    if gcc -v --help 2>&1 | grep -qw "\\-fstack\\-check"; then
+    if grep -qw -- '-fstack-check' <<<"${gcc_help}"; then
         cflags+=('-fno-stack-check')
     fi
-    if gcc -v --help 2>&1 | grep -qw "\\-fstack\\-clash\\-protection"; then
+    if grep -qw -- '-fstack-clash-protection' <<<"${gcc_help}"; then
         cflags+=('-fno-stack-clash-protection')
     fi
-    if gcc -v --help 2>&1 | grep -qw "\\-fstack\\-protector"; then
+    if grep -qw -- '-fstack-protector' <<<"${gcc_help}"; then
         cflags+=('-fno-stack-protector')
     fi
-    # 控制流保护相关
-    if gcc -v --help 2>&1 | grep -qw "\\-fcf\\-protection="; then
+    if grep -qw -- '-fcf-protection=' <<<"${gcc_help}"; then
         cflags+=('-fcf-protection=none')
     fi
-    # 分割栈相关
-    if gcc -v --help 2>&1 | grep -qw "\\-fsplit\\-stack"; then
+    if grep -qw -- '-fsplit-stack' <<<"${gcc_help}"; then
         cflags+=('-fno-split-stack')
     fi
-    # sanitizer 相关
-    if gcc -v --help 2>&1 | grep -qw "\\-fsanitize"; then
-        >temp.c # 创建一个空的 C 文件用于测试
-        if gcc -E -fno-sanitize=all temp.c >/dev/null 2>&1; then
+    if grep -qw -- '-fsanitize' <<<"${gcc_help}"; then
+        : >"${TMPFILE_DIR}/temp.c"
+        if gcc -E -fno-sanitize=all "${TMPFILE_DIR}/temp.c" >/dev/null 2>&1; then
             cflags+=('-fno-sanitize=all')
         fi
-        rm temp.c # 删除临时文件
+        rm -f "${TMPFILE_DIR}/temp.c"
     fi
-    # instrumentation 相关
-    if gcc -v --help 2>&1 | grep -qw "\\-finstrument\\-functions"; then
+    if grep -qw -- '-finstrument-functions' <<<"${gcc_help}"; then
         cflags+=('-fno-instrument-functions')
     fi
 }
@@ -539,16 +565,40 @@ function gen_cflags() {
 # 参数: 无
 # 返回值: 无 (执行下载、配置和编译过程)
 # =============================================================================
+function fetch_latest_nginx_version() {
+    curl -fsSL --connect-timeout 10 --max-time 20 "https://api.github.com/repos/nginx/nginx/tags?per_page=100" |
+        jq -r '.[].name // empty' |
+        grep -E '^release-[0-9]+\.[0-9]+\.[0-9]+$' |
+        sort -rV | head -n 1 | sed 's/^release-/nginx-/'
+}
+
+function fetch_latest_openssl_tag() {
+    local tag=""
+    tag="$(curl -fsSL --connect-timeout 10 --max-time 20 "https://api.github.com/repos/openssl/openssl/releases/latest" 2>/dev/null | jq -r '.tag_name // empty')"
+    if [[ ! "${tag}" =~ ^openssl-[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        tag="$(curl -fsSL --connect-timeout 10 --max-time 20 "https://api.github.com/repos/openssl/openssl/tags?per_page=100" |
+            jq -r '.[].name // empty' |
+            grep -E '^openssl-[0-9]+\.[0-9]+\.[0-9]+$' |
+            sort -rV | head -n 1)"
+    fi
+    printf '%s\n' "${tag}"
+}
+
 function source_compile() {
-    cd "${TMPFILE_DIR}" # 切换到临时目录
-    print_info "$(echo "$I18N_DATA" | jq -r '.nginx.compile.fetch_versions')"
-    # 从 GitHub API 获取最新的 Nginx release 标签名 (支持多位数版本号并按语义化版本排序)
-    local nginx_version="$(wget -qO- --no-check-certificate https://api.github.com/repos/nginx/nginx/tags | grep 'name' | cut -d\" -f4 | grep -E '^release-[0-9]+\.[0-9]+\.[0-9]+$' | sort -rV | head -1 | sed 's/release/nginx/')"
-    # 获取最新的 OpenSSL 标签名 (格式为 openssl-openssl-x.y.z，以匹配 GitHub 归档解压目录名)
-    local openssl_version="openssl-$(wget -qO- --no-check-certificate https://api.github.com/repos/openssl/openssl/tags | grep 'name' | cut -d\" -f4 | grep -E '^openssl-[0-9]+\.[0-9]+\.[0-9]+$' | sort -rV | head -1)"
+    local nginx_version="${1:-}"
+    local openssl_tag="${2:-}"
+
+    cd "${TMPFILE_DIR}" || print_error "无法进入临时目录: ${TMPFILE_DIR}"
+    if [[ -z "${nginx_version}" || -z "${openssl_tag}" ]]; then
+        print_info "$(echo "$I18N_DATA" | jq -r '.nginx.compile.fetch_versions')"
+        [[ -z "${nginx_version}" ]] && nginx_version="$(fetch_latest_nginx_version)"
+        [[ -z "${openssl_tag}" ]] && openssl_tag="$(fetch_latest_openssl_tag)"
+    fi
+    # GitHub 归档解压后的目录名格式为 openssl-openssl-x.y.z
+    local openssl_version="openssl-${openssl_tag}"
 
     # 校验版本号是否成功获取
-    if [[ -z "${nginx_version}" || "${openssl_version}" == "openssl-" ]]; then
+    if [[ -z "${nginx_version}" || -z "${openssl_tag}" ]]; then
         print_error "获取 Nginx 或 OpenSSL 最新版本号失败，请检查网络连接或 GitHub API 限流。"
     fi
 
@@ -556,26 +606,21 @@ function source_compile() {
     gen_cflags
 
     print_info "$(echo "$I18N_DATA" | jq -r '.nginx.compile.download_nginx')"
-    # 下载 Nginx 源码包
-    _error_detect "curl -fsSL -o ${nginx_version}.tar.gz https://nginx.org/download/${nginx_version}.tar.gz"
-    # 解压 Nginx 源码
-    tar -zxf "${nginx_version}.tar.gz"
+    _error_detect "curl -fsSL --connect-timeout 15 --max-time 120 -o '${nginx_version}.tar.gz' 'https://nginx.org/download/${nginx_version}.tar.gz'"
+    _error_detect "tar -zxf '${nginx_version}.tar.gz'"
 
     print_info "$(echo "$I18N_DATA" | jq -r '.nginx.compile.download_openssl')"
-    # 下载 OpenSSL 源码包 (注意 URL 结构)
-    _error_detect "curl -fsSL -o ${openssl_version}.tar.gz https://github.com/openssl/openssl/archive/${openssl_version#*-}.tar.gz"
-    # 解压 OpenSSL 源码
-    tar -zxf "${openssl_version}.tar.gz"
+    _error_detect "curl -fsSL --connect-timeout 15 --max-time 180 -o '${openssl_version}.tar.gz' 'https://github.com/openssl/openssl/archive/${openssl_tag}.tar.gz'"
+    _error_detect "tar -zxf '${openssl_version}.tar.gz'"
 
-    # 如果启用了 Brotli，则下载并初始化 ngx_brotli 模块
+    # 如果启用了 Brotli，则浅克隆并初始化 ngx_brotli 子模块
     if [[ "${is_enable_brotli}" =~ ^[Yy]$ ]]; then
         print_info "$(echo "$I18N_DATA" | jq -r '.nginx.compile.fetch_brotli')"
-        _error_detect "git clone https://github.com/google/ngx_brotli && cd ngx_brotli && git submodule update --init"
-        cd "${TMPFILE_DIR}" # 返回临时目录
+        _error_detect "git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/google/ngx_brotli '${TMPFILE_DIR}/ngx_brotli'"
     fi
 
     # 进入 Nginx 源码目录
-    cd "${nginx_version}"
+    cd "${TMPFILE_DIR}/${nginx_version}" || print_error "无法进入源码目录: ${nginx_version}"
 
     # 对 Nginx 源码进行一些 sed 修改，以优化 Perl 模块的编译
     sed -i "s/OPTIMIZE[ \\t]*=>[ \\t]*'-O'/OPTIMIZE          => '-O3'/g" src/http/modules/perl/Makefile.PL
@@ -584,13 +629,51 @@ function source_compile() {
 
     # 执行 Nginx 的 configure 脚本，设置各种编译选项和模块
     print_info "$(echo "$I18N_DATA" | jq -r '.nginx.compile.configure')"
+    local -a configure_args=(
+        --prefix="${NGINX_PATH}"
+        --user=root
+        --group=root
+        --with-threads
+        --with-file-aio
+        --with-http_ssl_module
+        --with-http_v2_module
+        --with-http_v3_module
+        --with-http_realip_module
+        --with-http_addition_module
+        --with-http_xslt_module=dynamic
+        --with-http_image_filter_module=dynamic
+        --with-http_geoip_module=dynamic
+        --with-http_sub_module
+        --with-http_dav_module
+        --with-http_flv_module
+        --with-http_mp4_module
+        --with-http_gunzip_module
+        --with-http_gzip_static_module
+        --with-http_auth_request_module
+        --with-http_random_index_module
+        --with-http_secure_link_module
+        --with-http_degradation_module
+        --with-http_slice_module
+        --with-http_stub_status_module
+        --with-http_perl_module=dynamic
+        --with-mail=dynamic
+        --with-mail_ssl_module
+        --with-stream
+        --with-stream_ssl_module
+        --with-stream_realip_module
+        --with-stream_geoip_module=dynamic
+        --with-stream_ssl_preread_module
+        --with-google_perftools_module
+        --with-compat
+        --with-cc-opt="${cflags[*]}"
+        --with-openssl="../${openssl_version}"
+        --with-openssl-opt="${cflags[*]}"
+    )
     if [[ "${is_enable_brotli}" =~ ^[Yy]$ ]]; then
-        # 如果启用 Brotli，则添加 --add-module 选项
-        ./configure --prefix="${NGINX_PATH}" --user=root --group=root --with-threads --with-file-aio --with-http_ssl_module --with-http_v2_module --with-http_v3_module --with-http_realip_module --with-http_addition_module --with-http_xslt_module=dynamic --with-http_image_filter_module=dynamic --with-http_geoip_module=dynamic --with-http_sub_module --with-http_dav_module --with-http_flv_module --with-http_mp4_module --with-http_gunzip_module --with-http_gzip_static_module --with-http_auth_request_module --with-http_random_index_module --with-http_secure_link_module --with-http_degradation_module --with-http_slice_module --with-http_stub_status_module --with-http_perl_module=dynamic --with-mail=dynamic --with-mail_ssl_module --with-stream --with-stream_ssl_module --with-stream_realip_module --with-stream_geoip_module=dynamic --with-stream_ssl_preread_module --with-google_perftools_module --add-module="../ngx_brotli" --with-compat --with-cc-opt="${cflags[*]}" --with-openssl="../${openssl_version}" --with-openssl-opt="${cflags[*]}"
-    else
-        # 不启用 Brotli
-        ./configure --prefix="${NGINX_PATH}" --user=root --group=root --with-threads --with-file-aio --with-http_ssl_module --with-http_v2_module --with-http_v3_module --with-http_realip_module --with-http_addition_module --with-http_xslt_module=dynamic --with-http_image_filter_module=dynamic --with-http_geoip_module=dynamic --with-http_sub_module --with-http_dav_module --with-http_flv_module --with-http_mp4_module --with-http_gunzip_module --with-http_gzip_static_module --with-http_auth_request_module --with-http_random_index_module --with-http_secure_link_module --with-http_degradation_module --with-http_slice_module --with-http_stub_status_module --with-http_perl_module=dynamic --with-mail=dynamic --with-mail_ssl_module --with-stream --with-stream_ssl_module --with-stream_realip_module --with-stream_geoip_module=dynamic --with-stream_ssl_preread_module --with-google_perftools_module --with-compat --with-cc-opt="${cflags[*]}" --with-openssl="../${openssl_version}" --with-openssl-opt="${cflags[*]}"
+        configure_args+=(--add-module="../ngx_brotli")
     fi
+
+    ./configure "${configure_args[@]}" || print_error "Nginx ./configure 失败，请检查依赖库与编译环境。"
 
     print_info "$(echo "$I18N_DATA" | jq -r '.nginx.compile.swap')"
     # 创建并启用 512MB swap 空间以辅助编译
@@ -610,8 +693,8 @@ function source_compile() {
 function source_install() {
     source_compile # 先执行编译
     print_info "$(echo "$I18N_DATA" | jq -r '.nginx.install.start_install')"
-    make install                                      # 执行安装 (将文件复制到 --prefix 指定的目录)
-    mkdir -p /var/log/nginx                           # 创建日志目录
+    _error_detect "make install"                      # 执行安装 (将文件复制到 --prefix 指定的目录)
+    mkdir -p "${NGINX_LOG_PATH}"                      # 创建日志目录
     ln -sf "${NGINX_PATH}/sbin/nginx" /usr/sbin/nginx # 创建软链接以便全局使用 nginx 命令
 }
 
@@ -619,19 +702,26 @@ function source_install() {
 # 函数名称: source_update
 # 功能描述: 检查并更新 Nginx (如果需要)。
 # 参数: 无
-# 返回值: 0-执行了更新 1-无需更新 (由 return 语句决定)
+# 返回值: 0-操作正常完成（无论是否需要更新）
 # =============================================================================
 function source_update() {
+    cmd_exists "nginx" || print_error "当前系统未检测到已安装的 Nginx，请先执行 --install。"
+
+    # 若旧版 nginx.service 仍包含会删除 Xray 套接字或收紧权限为 711 的语句，自动迁移修复
+    if [[ -f /etc/systemd/system/nginx.service ]] && grep -Eq '(rm -rf /dev/shm/nginx$|chmod 711 /dev/shm/nginx$)' /etc/systemd/system/nginx.service; then
+        print_warn "检测到旧版 nginx.service 会清理 /dev/shm/nginx 或重置权限为 711，正在自动修复 systemd 服务配置..."
+        systemctl_config_nginx
+    fi
+
     # 如果未手动传 --brotli，自动检测当前 Nginx 是否已编译 Brotli 并继承该状态
-    if [[ -z "${is_enable_brotli}" ]] && cmd_exists "nginx" && nginx -V 2>&1 | grep -q "ngx_brotli"; then
+    if [[ -z "${is_enable_brotli}" ]] && nginx -V 2>&1 | grep -q "ngx_brotli"; then
         is_enable_brotli='Y'
         print_info "检测到当前 Nginx 已启用 ngx_brotli 模块，更新时将自动保留。"
     fi
 
     print_info "$(echo "$I18N_DATA" | jq -r '.nginx.update.fetch_versions')"
-    # 获取最新的版本号 (支持多位数版本号并按语义化版本排序)
-    local latest_nginx_version="$(wget -qO- --no-check-certificate https://api.github.com/repos/nginx/nginx/tags | grep 'name' | cut -d\" -f4 | grep -E '^release-[0-9]+\.[0-9]+\.[0-9]+$' | sort -rV | head -1 | sed 's/release/nginx/')"
-    local latest_openssl_version="$(wget -qO- --no-check-certificate https://api.github.com/repos/openssl/openssl/tags | grep 'name' | cut -d\" -f4 | grep -E '^openssl-[0-9]+\.[0-9]+\.[0-9]+$' | sort -rV | head -1)"
+    local latest_nginx_version="$(fetch_latest_nginx_version)"
+    local latest_openssl_version="$(fetch_latest_openssl_tag)"
 
     if [[ -z "${latest_nginx_version}" || -z "${latest_openssl_version}" ]]; then
         print_error "获取 Nginx 或 OpenSSL 最新版本号失败，请检查网络连接或 GitHub API 限流。"
@@ -645,18 +735,21 @@ function source_update() {
     print_info "$(echo "$I18N_DATA" | jq -r '.nginx.update.check_update')"
     # 使用 _version_gt 函数严格比较版本，仅在任一组件存在更高版本时才进行更新
     if _version_gt "${latest_nginx_version#*-}" "${current_version_nginx}" || _version_gt "${latest_openssl_version#*-}" "${current_version_openssl}"; then
-        source_compile # 重新编译新版本
+        # 直接复用刚查询到的版本号，避免二次调用 GitHub API 触发限流
+        source_compile "${latest_nginx_version}" "${latest_openssl_version}"
         print_info "$(echo "$I18N_DATA" | jq -r '.nginx.update.start_update')"
 
         local current_date="$(date +%F)"
         # 备份旧的 nginx 二进制文件
-        mv -f "${NGINX_PATH}/sbin/nginx" "${NGINX_PATH}/sbin/nginx_${current_date}"
+        mv -f "${NGINX_PATH}/sbin/nginx" "${NGINX_PATH}/sbin/nginx_${current_date}" || print_error "备份旧版 Nginx 失败。"
         # 备份旧的动态模块
         backup_files "${NGINX_PATH}/modules" "${current_date}"
         # 复制新编译的 nginx 二进制文件和动态模块
-        cp objs/nginx "${NGINX_PATH}/sbin/"
+        cp -f objs/nginx "${NGINX_PATH}/sbin/nginx" || print_error "写入新版 Nginx 二进制失败。"
         mkdir -p "${NGINX_PATH}/modules"
-        cp objs/*.so "${NGINX_PATH}/modules/"
+        if compgen -G "objs/*.so" >/dev/null; then
+            cp -f objs/*.so "${NGINX_PATH}/modules/" || print_error "写入新版动态模块失败。"
+        fi
         # 更新软链接
         ln -sf "${NGINX_PATH}/sbin/nginx" /usr/sbin/nginx
 
@@ -667,6 +760,16 @@ function source_update() {
                 [[ -f "$bak" ]] && mv -f "$bak" "${bak%_${current_date}}"
             done
             print_error "新版 Nginx 配置校验 (nginx -t) 失败，已自动回滚到旧版本。"
+        fi
+
+        # 同步更新脚本配置中的 Nginx 版本记录
+        if [[ -f "${SCRIPT_CONFIG_PATH}" ]]; then
+            local new_ver="$(nginx -V 2>&1 | grep "^nginx version:.*" | cut -d / -f 2)"
+            local updated_cfg=""
+            if [[ -n "${new_ver}" ]] && updated_cfg="$(jq --arg v "${new_ver}" '.nginx.version = $v' "${SCRIPT_CONFIG_PATH}" 2>/dev/null)" && [[ -n "${updated_cfg}" ]]; then
+                local tmp_cfg="${SCRIPT_CONFIG_PATH}.tmp.$$"
+                printf '%s\n' "${updated_cfg}" >"${tmp_cfg}" && mv -f "${tmp_cfg}" "${SCRIPT_CONFIG_PATH}"
+            fi
         fi
 
         # 如果 Nginx 服务正在运行，则执行平滑升级
@@ -702,11 +805,11 @@ function source_update() {
                 systemctl restart nginx
             fi
         fi
-        return 0 # 表示执行了更新
+        return 0
     else
         print_info "当前 Nginx (${current_version_nginx}) 与 OpenSSL (${current_version_openssl}) 已是最新版本，无需更新。"
+        return 0
     fi
-    return 1 # 表示无需更新
 }
 
 # =============================================================================
@@ -717,10 +820,11 @@ function source_update() {
 # =============================================================================
 function purge_nginx() {
     print_info "$(echo "$I18N_DATA" | jq -r '.nginx.purge.start_purge')"
-    systemctl stop nginx                     # 停止 Nginx 服务
+    systemctl -q is-active nginx && systemctl stop nginx || true
+    systemctl -q is-enabled nginx && systemctl disable nginx || true
     rm -rf "${NGINX_PATH}"                   # 删除安装目录
-    rm -rf /usr/sbin/nginx                   # 删除软链接
-    rm -rf /etc/systemd/system/nginx.service # 删除 systemd 服务文件
+    rm -f /usr/sbin/nginx                    # 删除软链接
+    rm -f /etc/systemd/system/nginx.service  # 删除 systemd 服务文件
     rm -rf "${NGINX_LOG_PATH}"               # 删除日志目录
     systemctl daemon-reload                  # 重新加载 systemd 配置
     print_info "$(echo "$I18N_DATA" | jq -r '.nginx.purge.purged')"
@@ -729,6 +833,8 @@ function purge_nginx() {
 # =============================================================================
 # 函数名称: systemctl_config_nginx
 # 功能描述: 配置 Nginx 的 systemd 服务文件。
+#           仅清理 tcmalloc 子目录，不删除 /dev/shm/nginx 且保持 1777 权限，
+#           避免重启 Nginx 时误删 Xray 的 UDS 套接字或破坏 User=xray 写入权限。
 # 参数: 无
 # 返回值: 无 (创建服务文件并重新加载 systemd)
 # =============================================================================
@@ -744,12 +850,12 @@ Wants=network-online.target
 [Service]
 Type=forking
 PIDFile=/run/nginx.pid
-# 清理并创建共享内存目录用于 tcmalloc
-ExecStartPre=/bin/rm -rf /dev/shm/nginx
-ExecStartPre=/bin/mkdir /dev/shm/nginx
-ExecStartPre=/bin/chmod 711 /dev/shm/nginx
-ExecStartPre=/bin/mkdir /dev/shm/nginx/tcmalloc
-ExecStartPre=/bin/chmod 0777 /dev/shm/nginx/tcmalloc
+# 准备共享内存目录并仅重置 tcmalloc 子目录（保留 Xray 的 UDS 套接字与 1777 权限）
+ExecStartPre=/bin/mkdir -p /dev/shm/nginx
+ExecStartPre=/bin/chmod 1777 /dev/shm/nginx
+ExecStartPre=/bin/rm -rf /dev/shm/nginx/tcmalloc
+ExecStartPre=/bin/mkdir -p /dev/shm/nginx/tcmalloc
+ExecStartPre=/bin/chmod 1777 /dev/shm/nginx/tcmalloc
 # 测试配置文件
 ExecStartPre=/usr/sbin/nginx -t -q -g 'daemon on; master_process on;'
 # 启动 Nginx
@@ -758,8 +864,8 @@ ExecStart=/usr/sbin/nginx -g 'daemon on; master_process on;'
 ExecReload=/usr/sbin/nginx -g 'daemon on; master_process on;' -s reload
 # 停止 Nginx
 ExecStop=/bin/kill -s QUIT \$MAINPID
-# 停止后清理共享内存
-ExecStopPost=/bin/rm -rf /dev/shm/nginx
+# 停止后仅清理 tcmalloc 子目录，避免误删运行中的 Xray UDS 套接字
+ExecStopPost=/bin/rm -rf /dev/shm/nginx/tcmalloc
 TimeoutStopSec=5
 KillMode=mixed
 PrivateTmp=true
@@ -843,6 +949,8 @@ function main() {
         esac
         shift # 移动到下一个参数
     done
+
+    [[ -z "${action}" ]] && show_help
 
     # 根据解析出的 action 执行相应的操作
     case "${action}" in

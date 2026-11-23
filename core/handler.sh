@@ -5,7 +5,7 @@
 # Xray-script:
 #   https://github.com/zxcvos/Xray-script
 # =============================================================================
-# 注释: 通过 Qwen3-Coder 生成。
+# 注释: 通过 Gemini-Neon 生成。
 # 脚本名称: handler.sh
 # 功能描述: Xray-script 项目的处理器脚本。
 #           负责执行具体的操作，如安装/卸载 Xray/Nginx、配置文件生成、
@@ -64,6 +64,7 @@ readonly GEODATA_PATH="${TOOL_DIR}/geodata.sh"  # GeoData 更新脚本
 # 定义外部配置文件和脚本的路径
 readonly XRAY_CONFIG_DIR="/usr/local/etc/xray"                     # Xray 配置目录
 readonly XRAY_CONFIG_PATH="${XRAY_CONFIG_DIR}/config.json"         # Xray 最终配置文件路径
+readonly XRAY_SHARE_DIR="/usr/local/share/xray"                    # Xray 地理数据库目录
 readonly XRAY_DROPIN_DIR="/etc/systemd/system/xray.service.d"      # Xray systemd Drop-in 目录
 readonly XRAY_UDS_DROPIN_PATH="${XRAY_DROPIN_DIR}/20-uds-shm.conf" # Xray UDS 权限 Drop-in 配置
 readonly SCRIPT_CONFIG_PATH="${SCRIPT_CONFIG_DIR}/config.json" # 脚本主配置文件路径
@@ -71,9 +72,11 @@ readonly ACME_PATH="${HOME}/.acme.sh/acme.sh"                  # ACME.sh 脚本�
 
 # --- 全局变量声明 ---
 # 声明用于存储配置数据和国际化数据的全局变量
-declare SCRIPT_CONFIG="$(jq '.' "${SCRIPT_CONFIG_PATH}")" # 存储从 config.json 读取的脚本配置
+declare SCRIPT_CONFIG=""                                  # 存储从 config.json 读取的脚本配置
+[[ -f "${SCRIPT_CONFIG_PATH}" ]] && SCRIPT_CONFIG="$(jq '.' "${SCRIPT_CONFIG_PATH}")"
 declare XRAY_CONFIG=""                                    # 存储 Xray 配置 (通常在运行时加载)
 declare LANG_PARAM=''                                     # (未在脚本中实际使用，可能是预留)
+declare CURRENT_LANG='zh'                                 # 当前生效的语言代码
 declare I18N_DATA=''                                      # 存储从 i18n JSON 文件中读取的全部数据
 # 声明一个关联数组，用于在脚本运行时临时存储用户输入的配置数据
 declare -A CONFIG_DATA # 用于临时存储用户输入的配置数据
@@ -91,11 +94,20 @@ declare -A CONFIG_DATA # 用于临时存储用户输入的配置数据
 # =============================================================================
 function load_i18n() {
     # 从配置文件中读取语言设置
-    local lang="$(jq -r '.language' "${SCRIPT_CONFIG_PATH}")"
+    local lang=""
+    if [[ -f "${SCRIPT_CONFIG_PATH}" ]]; then
+        lang="$(jq -r '.language // "auto"' "${SCRIPT_CONFIG_PATH}" 2>/dev/null)"
+    fi
+    [[ -z "${lang}" || "${lang}" == "null" ]] && lang="auto"
     # 如果语言设置为 "auto"，则使用系统环境变量 LANG 的第一部分作为语言代码
     if [[ "$lang" == "auto" ]]; then
-        lang=$(echo "$LANG" | cut -d'_' -f1)
+        lang="${LANG%%_*}"
+        lang="${lang%%.*}"
+        case "${lang}" in
+        "" | C | POSIX) lang="en" ;;
+        esac
     fi
+    CURRENT_LANG="${lang}"
     # 构造 i18n 文件的完整路径
     local i18n_file="${I18N_DIR}/${lang}.json"
     # 检查 i18n 文件是否存在
@@ -123,11 +135,9 @@ function load_i18n() {
 # =============================================================================
 function _error() {
     # 打印红色的错误标题（从 i18n 数据获取）
-    printf "${RED}[$(echo "$I18N_DATA" | jq -r '.title.error')] ${NC}" >&2
-    # 打印传入的错误信息
-    printf -- "%s" "$@" >&2
-    # 打印换行符
-    printf "\n" >&2
+    local title="Error"
+    [[ -n "${I18N_DATA}" ]] && title="$(echo "$I18N_DATA" | jq -r '.title.error // "Error"')"
+    printf '%b[%s]%b %s\n' "${RED}" "${title}" "${NC}" "$*" >&2
     # 退出脚本，错误码为 1
     exit 1
 }
@@ -232,7 +242,12 @@ function exec_read() {
     # 循环直到输入有效 (flag 为 false)
     while ${flag}; do
         # 调用 read.sh 脚本获取用户输入
-        result="$(bash "${READ_PATH}" "--${opt}")"
+        local read_rc=0
+        result="$(bash "${READ_PATH}" "--${opt}")" || read_rc=$?
+        # 响应 Ctrl+C 中断，避免在校验循环中卡死无法退出
+        if [[ ${read_rc} -eq 130 ]]; then
+            exit 130
+        fi
         # 根据配置项名称进行特定验证
         case "${opt}" in
         version)
@@ -288,17 +303,24 @@ function exec_read() {
             ;;
         short)
             # 特殊处理 Short IDs
+            CONFIG_DATA['short_ids']=""
             # 如果输入为空，进行验证 (可能是检查默认值)
             [[ -z "${result}" ]] && exec_check '--short' "${result}" && break
             # 将逗号分隔的输入分割成数组
             IFS=',' read -r -a values <<<"${result}"
+            local valid_short_count=0
             # 遍历每个 Short ID 进行验证
             for value in "${values[@]}"; do
+                value="${value#"${value%%[![:space:]]*}"}"
+                value="${value%"${value##*[![:space:]]}"}"
+                [[ -z "${value}" ]] && continue
                 if exec_check '--short' "${value}"; then
                     # 验证通过则追加到 CONFIG_DATA['short_ids']
                     CONFIG_DATA['short_ids']="${CONFIG_DATA['short_ids']} ${value}"
+                    ((++valid_short_count))
                 fi
             done
+            ((valid_short_count > 0)) || continue
             ;;
         path)
             # 验证路径
@@ -357,7 +379,10 @@ function reset_json_fields() {
 }
 
 function persist_script_config() {
-    echo "${SCRIPT_CONFIG}" >"${SCRIPT_CONFIG_PATH}" && sleep 2
+    [[ -n "${SCRIPT_CONFIG}" ]] || _error "refusing to write empty script config"
+    printf '%s\n' "${SCRIPT_CONFIG}" | jq -e '.' >/dev/null 2>&1 || _error "refusing to write invalid script config JSON"
+    local tmp_file="${SCRIPT_CONFIG_PATH}.tmp.$$"
+    printf '%s\n' "${SCRIPT_CONFIG}" >"${tmp_file}" && mv -f "${tmp_file}" "${SCRIPT_CONFIG_PATH}" && sleep 2
 }
 
 function ensure_xray_uds_dropin() {
@@ -376,19 +401,53 @@ function ensure_xray_uds_dropin() {
 }
 
 function fix_xray_config_permissions() {
-    [[ -d "${XRAY_CONFIG_DIR}" ]] || return 0
-    if getent group xray >/dev/null 2>&1; then
-        chown -R root:xray "${XRAY_CONFIG_DIR}"
-        chmod 750 "${XRAY_CONFIG_DIR}"
-        find "${XRAY_CONFIG_DIR}" -maxdepth 1 -type f -name '*.json' -exec chmod 640 {} +
-    elif [[ -f "${XRAY_CONFIG_PATH}" ]]; then
-        chmod 644 "${XRAY_CONFIG_PATH}"
+    if [[ -d "${XRAY_CONFIG_DIR}" ]]; then
+        if getent group xray >/dev/null 2>&1; then
+            chown -R root:xray "${XRAY_CONFIG_DIR}"
+            chmod 750 "${XRAY_CONFIG_DIR}"
+            find "${XRAY_CONFIG_DIR}" -maxdepth 1 -type f -name '*.json' -exec chmod 640 {} +
+        elif [[ -f "${XRAY_CONFIG_PATH}" ]]; then
+            chmod 644 "${XRAY_CONFIG_PATH}"
+        fi
+    fi
+
+    if [[ -d "${XRAY_SHARE_DIR}" ]]; then
+        if id -u xray >/dev/null 2>&1 && getent group xray >/dev/null 2>&1; then
+            chown -R xray:xray "${XRAY_SHARE_DIR}"
+        fi
+        chmod 755 "${XRAY_SHARE_DIR}"
+        find "${XRAY_SHARE_DIR}" -maxdepth 1 -type f -name '*.dat' -exec chmod 644 {} +
     fi
 }
 
+function run_xray_install_script() {
+    local install_script=""
+    install_script="$(curl -fsSL --connect-timeout 15 --max-time 60 https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" || return 1
+    [[ -n "${install_script}" ]] || return 1
+    bash -c "${install_script}" @ "$@"
+}
+
+function ensure_xray_geodata() {
+    if [[ ! -s "${XRAY_SHARE_DIR}/geoip.dat" || ! -s "${XRAY_SHARE_DIR}/geosite.dat" ]]; then
+        if [[ -f "${GEODATA_PATH}" ]]; then
+            chmod a+x "${GEODATA_PATH}"
+            bash "${GEODATA_PATH}" || run_xray_install_script update-geodata
+        else
+            run_xray_install_script update-geodata
+        fi
+        if [[ ! -s "${XRAY_SHARE_DIR}/geoip.dat" || ! -s "${XRAY_SHARE_DIR}/geosite.dat" ]]; then
+            _error "xray geodata missing in ${XRAY_SHARE_DIR}"
+        fi
+    fi
+    fix_xray_config_permissions
+}
+
 function persist_xray_config() {
+    [[ -n "${XRAY_CONFIG}" ]] || _error "refusing to write empty Xray config"
+    printf '%s\n' "${XRAY_CONFIG}" | jq -e '.' >/dev/null 2>&1 || _error "refusing to write invalid Xray config JSON"
     mkdir -p "${XRAY_CONFIG_DIR}"
-    echo "${XRAY_CONFIG}" >"${XRAY_CONFIG_PATH}"
+    local tmp_file="${XRAY_CONFIG_PATH}.tmp.$$"
+    printf '%s\n' "${XRAY_CONFIG}" >"${tmp_file}" && mv -f "${tmp_file}" "${XRAY_CONFIG_PATH}"
     fix_xray_config_permissions
     sleep 2
 }
@@ -681,8 +740,11 @@ function get_custom_site_json_by_index() {
 function add_rule() {
     local rule_tag=$1     # 获取规则标签
     local domain_or_ip=$2 # 获取规则类型 (domain/ip)
-    # 将逗号分隔的值转换为 JSON 数组
-    local value=$(echo "$3" | tr ',' '\n' | jq -R | jq -s)
+    # 将逗号分隔的值去除首尾空白并过滤空项后转换为 JSON 数组
+    local value="$(printf '%s\n' "$3" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | jq -R 'select(length > 0)' | jq -s 'unique')"
+    if [[ "$(printf '%s' "${value}" | jq 'length')" -eq 0 ]]; then
+        _error "No valid value supplied for ${rule_tag}"
+    fi
     local outboundTag=$4 # 获取出站标签
     local position=$5    # 获取插入位置参数
     local target_tag=$6  # 获取目标规则标签参数
@@ -700,6 +762,9 @@ function add_rule() {
         elif [[ "${domain_or_ip}" == "ip" ]]; then
             # 将新值追加到现有 ip 数组并去重
             XRAY_CONFIG="$(echo "${XRAY_CONFIG}" | jq --arg ruleTag "${rule_tag}" --argjson value "${value}" '.routing.rules |= map(if .ruleTag == $ruleTag then .ip += $value | .ip |= unique else . end)')"
+        # 如果是 protocol 规则
+        elif [[ "${domain_or_ip}" == "protocol" ]]; then
+            XRAY_CONFIG="$(echo "${XRAY_CONFIG}" | jq --arg ruleTag "${rule_tag}" --argjson value "${value}" '.routing.rules |= map(if .ruleTag == $ruleTag then .protocol += $value | .protocol |= unique else . end)')"
         fi
     else
         # 规则不存在，创建新的规则 JSON 对象
@@ -729,7 +794,7 @@ function add_rule() {
         else
             # 未指定 target_tag
             # 如果指定了数字位置
-            if [[ -n "${position}" && "${position}" -ge 0 ]]; then
+            if [[ "${position}" =~ ^[0-9]+$ ]]; then
                 # 插入到指定索引位置
                 XRAY_CONFIG="$(echo "${XRAY_CONFIG}" | jq --argjson position "${position}" --argjson new_rule "${new_rule}" '.routing.rules |= .[:$position] + $new_rule + .[$position:]')"
             else
@@ -764,7 +829,7 @@ function handler_routing() {
     local rules_json=''
 
     # WARP 规则只能在 WARP 出站已启用时添加
-    if [[ "${rule_type}" == 'warp' && ${WARP_STATUS} -ne 1 ]]; then
+    if [[ "${rule_type}" == 'warp' && "${WARP_STATUS}" != "1" ]]; then
         _error "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.warp.status")"
     fi
 
@@ -812,7 +877,7 @@ function handler_reset_script_config() {
         ;;
     esac
     # 将重置后的脚本配置写入文件
-    echo "${SCRIPT_CONFIG}" >"${SCRIPT_CONFIG_PATH}" && sleep 2
+    persist_script_config
 }
 
 function handler_ca_server() {
@@ -847,23 +912,28 @@ function handler_ca_server() {
         reissue_targets+=("${reissue_domain}")
     done < <(echo "${SCRIPT_CONFIG}" | jq -r '.nginx.custom_sites // [] | .[] | .domain')
 
-    for reissue_domain in "${reissue_targets[@]}"; do
-        if exec_ssl '--issue' "--domain=${reissue_domain}" "--ca=${target_ca_server}"; then
-            switched_domains+=("${reissue_domain}")
-            continue
-        fi
+    # 仅在 acme.sh 已安装时才重签现有证书并切换默认 CA；首次 SNI 初始化阶段只需落盘 ca_server
+    if [[ -e "${ACME_PATH}" ]]; then
+        for reissue_domain in "${reissue_targets[@]}"; do
+            if exec_ssl '--issue' "--domain=${reissue_domain}" "--ca=${target_ca_server}"; then
+                switched_domains+=("${reissue_domain}")
+                continue
+            fi
 
-        for reissue_domain in "${switched_domains[@]}"; do
-            exec_ssl '--issue' "--domain=${reissue_domain}" "--ca=${current_ca_server}" || true
+            for reissue_domain in "${switched_domains[@]}"; do
+                exec_ssl '--issue' "--domain=${reissue_domain}" "--ca=${current_ca_server}" || true
+            done
+            exec_ssl '--set-ca' "--ca=${current_ca_server}" || true
+            handler_update_ocsp_config "${current_ca_server}" 'y' || true
+            _error "ca switch failed, rolled back to ${current_ca_server}"
         done
-        exec_ssl '--set-ca' "--ca=${current_ca_server}" || true
-        handler_update_ocsp_config "${current_ca_server}" 'y' || true
-        _error "ca switch failed, rolled back to ${current_ca_server}"
-    done
+    fi
 
     SCRIPT_CONFIG="$(echo "${SCRIPT_CONFIG}" | jq --arg caServer "${target_ca_server,,}" '.nginx.ca_server = $caServer')"
-    echo "${SCRIPT_CONFIG}" >"${SCRIPT_CONFIG_PATH}" && sleep 2
-    exec_ssl '--set-ca' "--ca=${target_ca_server}" || _error "failed to set acme default ca"
+    persist_script_config
+    if [[ -e "${ACME_PATH}" ]]; then
+        exec_ssl '--set-ca' "--ca=${target_ca_server}" || _error "failed to set acme default ca"
+    fi
     handler_update_ocsp_config "${target_ca_server}" 'y'
 }
 
@@ -921,7 +991,7 @@ function handler_script_config() {
     # 获取端口，默认 443
     local XRAY_PORT="${CONFIG_DATA['port']:-443}"
     # 获取或生成 UUID
-    local XRAY_UUID="$(exec_generate '--uuid' ${CONFIG_DATA['uuid']})"
+    local XRAY_UUID="$(exec_generate '--uuid' "${CONFIG_DATA['uuid']}")"
     # 获取或生成 Fallback UUID
     local FALLBACK_UUID="${CONFIG_DATA['fallback']:-$(exec_generate '--uuid')}"
     # 获取或生成 Trojan 密码
@@ -932,12 +1002,13 @@ function handler_script_config() {
     local XHTTP_PATH="${CONFIG_DATA['path']:-$(exec_generate '--path')}"
     # 获取或生成目标域名
     local TARGET_DOMAIN="${CONFIG_DATA['target']:-$(exec_generate '--target')}"
-    # 生成服务器名称列表
+    # 生成服务器名称列表（generate.sh 会将新目标写入 SCRIPT_CONFIG_PATH，需重新加载避免覆盖丢失）
     local SERVER_NAMES="$(exec_generate '--server-names' "${TARGET_DOMAIN}")"
+    SCRIPT_CONFIG="$(jq '.' "${SCRIPT_CONFIG_PATH}")"
     # 获取 CDN 域名
     local CDN_DOMAIN="${CONFIG_DATA['cdn']}"
     # 获取或生成 Short IDs
-    local SHORT_IDS="$(exec_generate '--short-ids' ${CONFIG_DATA['short_ids']:-'8 8'})"
+    local SHORT_IDS="$(exec_generate '--short-ids' "${CONFIG_DATA['short_ids']:-8 8}")"
     # 获取 CA 邮箱
     local CA_EMAIL="${CONFIG_DATA['email']}"
     # 更新脚本配置中的规则状态
@@ -999,7 +1070,7 @@ function handler_script_config() {
     SCRIPT_CONFIG="$(echo "${SCRIPT_CONFIG}" | jq --arg tag "${CONFIG_TAG}" '.xray.tag = $tag')"
     SCRIPT_CONFIG="$(echo "${SCRIPT_CONFIG}" | jq --argjson port "${XRAY_PORT}" '.xray.port = $port')"
     # 将更新后的脚本配置写入文件
-    echo "${SCRIPT_CONFIG}" >"${SCRIPT_CONFIG_PATH}" && sleep 2
+    persist_script_config
 }
 
 # =============================================================================
@@ -1014,23 +1085,25 @@ function handler_x25519_config() {
     # 打印绿色的配置更新提示
     echo -e "${GREEN}[$(echo "$I18N_DATA" | jq -r '.title.config')]${NC} $(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.script.config_update")" >&2
     # 生成 X25519 密钥对
-    local X25519="$(exec_generate '--x25519')"
+    local X25519=""
+    X25519="$(exec_generate '--x25519')" || _error "failed to generate x25519 key pair"
     # 提取私钥
     local PRIVATE_KEY="$(echo "${X25519}" | awk -F, '{print $1}')"
     # 提取公钥
     local PUBLIC_KEY="$(echo "${X25519}" | awk -F, '{print $2}')"
     # 提取 Hash32
     local HASH32="$(echo "${X25519}" | awk -F, '{print $3}')"
+    [[ -n "${PRIVATE_KEY}" && -n "${PUBLIC_KEY}" ]] || _error "failed to parse x25519 key pair"
     # 输出显示 x25519 密钥对
-    echo -e "${GREEN}[Private Key]${NC} "${PRIVATE_KEY}"" >&2
-    echo -e "${GREEN}[Public Key]${NC} "${PUBLIC_KEY}"" >&2
-    echo -e "${GREEN}[Hash32]${NC} "${HASH32}"" >&2
+    printf '%b[Private Key]%b %s\n' "${GREEN}" "${NC}" "${PRIVATE_KEY}" >&2
+    printf '%b[Public Key]%b %s\n' "${GREEN}" "${NC}" "${PUBLIC_KEY}" >&2
+    printf '%b[Hash32]%b %s\n' "${GREEN}" "${NC}" "${HASH32}" >&2
     # 更新脚本配置中的私钥和公钥，以及哈希值
     SCRIPT_CONFIG="$(echo "${SCRIPT_CONFIG}" | jq --arg privateKey "${PRIVATE_KEY}" '.xray.privateKey = $privateKey')"
     SCRIPT_CONFIG="$(echo "${SCRIPT_CONFIG}" | jq --arg publicKey "${PUBLIC_KEY}" '.xray.publicKey = $publicKey')"
     SCRIPT_CONFIG="$(echo "${SCRIPT_CONFIG}" | jq --arg hash32 "${HASH32}" '.xray.hash32 = $hash32')"
     # 将更新后的脚本配置写入文件
-    echo "${SCRIPT_CONFIG}" >"${SCRIPT_CONFIG_PATH}" && sleep 2
+    persist_script_config
 }
 
 # =============================================================================
@@ -1067,7 +1140,7 @@ function handler_xray_config() {
     local XRAY_RULES="$(echo "${SCRIPT_CONFIG}" | jq -r '.rules')"                   # 获取路由规则
     local WARP_STATUS="$(echo "${SCRIPT_CONFIG}" | jq -r '.xray.warp')"              # 获取 WARP 状态
     # 加载对应配置标签的 Xray 配置模板
-    XRAY_CONFIG="$(jq '.' ${SCRIPT_XRAY_DIR}/${CONFIG_TAG}.json)"
+    XRAY_CONFIG="$(jq '.' "${SCRIPT_XRAY_DIR}/${CONFIG_TAG}.json")" || _error "failed to load Xray template: ${CONFIG_TAG}.json"
     # 如果配置标签不是 sni，则更新端口
     if [[ "${CONFIG_TAG,,}" != 'sni' ]]; then
         XRAY_CONFIG="$(echo "${XRAY_CONFIG}" | jq --argjson port "${XRAY_PORT}" '.inbounds[1].port = $port')"
@@ -1116,33 +1189,35 @@ function handler_xray_config() {
     case "${XRAY_RULES_STATUS}" in
     0)
         # 保留当前路由规则
-        XRAY_CONFIG="$(echo "${XRAY_CONFIG}" | jq --argjson rules "${XRAY_RULES}" '.routing.rules = $rules')"
+        if [[ -n "${XRAY_RULES}" && "${XRAY_RULES}" != 'null' ]]; then
+            XRAY_CONFIG="$(echo "${XRAY_CONFIG}" | jq --argjson rules "${XRAY_RULES}" '.routing.rules = $rules')"
+        fi
         ;;
     1)
         # 重置并添加默认路由规则
-        [[ "${XRAY_RULES_BT}" -eq 1 ]] && add_rule "bt" "protocol" "bittorrent" "block" 1
-        if [[ "${XRAY_RULES_CN}" -eq 1 ]]; then
+        [[ "${XRAY_RULES_BT}" == "1" ]] && add_rule "bt" "protocol" "bittorrent" "block" 1
+        if [[ "${XRAY_RULES_CN}" == "1" ]]; then
             add_rule "cn-domain" "domain" "geosite:cn" "block" "after" "private-ip"
             add_rule "cn-ip" "ip" "geoip:cn" "block" "after" "cn-domain"
         fi
-        [[ "${XRAY_RULES_AD}" -eq 1 ]] && add_rule "ad-domain" "domain" "geosite:category-ads-all" "block"
+        [[ "${XRAY_RULES_AD}" == "1" ]] && add_rule "ad-domain" "domain" "geosite:category-ads-all" "block"
         ;;
     esac
     # 处理 WARP 状态
-    if [[ ${WARP_STATUS} -eq 1 ]]; then
+    if [[ "${WARP_STATUS}" == "1" ]]; then
         # 获取 WARP 容器 IP
         local container_ip="$(exec_docker '--obtain-container-ip')"
-        # 构造 WARP Socks 出站配置 JSON
+        [[ -n "${container_ip}" ]] || _error "failed to obtain WARP container IP"
+        # 构造 WARP Socks 出站配置 JSON（先去重再追加，避免重复 outbound）
         local socks_config='[{"tag":"warp","protocol":"socks","settings":{"servers":[{"address":"'"${container_ip}"'","port":40001}]}}]'
-        # 将 WARP 出站配置添加到 Xray 配置中
-        XRAY_CONFIG=$(echo "${XRAY_CONFIG}" | jq --argjson socks_config "${socks_config}" '.outbounds += $socks_config')
+        XRAY_CONFIG=$(echo "${XRAY_CONFIG}" | jq --argjson socks_config "${socks_config}" 'del(.outbounds[] | select(.tag == "warp")) | .outbounds += $socks_config')
     fi
     # 获取更新后的路由规则
     XRAY_RULES="$(echo "${XRAY_CONFIG}" | jq '.routing.rules')"
     # 更新脚本配置中的路由规则
     SCRIPT_CONFIG="$(echo "${SCRIPT_CONFIG}" | jq --argjson rules "${XRAY_RULES}" '.rules = $rules')"
     # 将更新后的脚本配置和 Xray 配置写入文件
-    echo "${SCRIPT_CONFIG}" >"${SCRIPT_CONFIG_PATH}" && sleep 2
+    persist_script_config
     persist_xray_config
 }
 
@@ -1491,22 +1566,25 @@ function handler_xray_version() {
     # 根据版本指定参数确定具体版本
     case "${xray_version,,}" in
     latest)
-        # 获取最新的 Xray 版本
-        CONFIG_DATA['version']="$(curl -fsSL https://api.github.com/repos/XTLS/Xray-core/releases | jq -r '.[0].tag_name')"
+        # 获取最新的 Xray 版本（带超时限制）
+        CONFIG_DATA['version']="$(curl -fsSL --connect-timeout 10 --max-time 20 https://api.github.com/repos/XTLS/Xray-core/releases | jq -r '.[0].tag_name // empty')"
         ;;
     custom)
         # 读取用户自定义的版本
         exec_read 'version'
         ;;
     *)
-        # 获取最新的 release 版本
-        CONFIG_DATA['version']="$(curl -fsSL https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r '.tag_name')"
+        # 获取最新的 release 版本（带超时限制）
+        CONFIG_DATA['version']="$(curl -fsSL --connect-timeout 10 --max-time 20 https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r '.tag_name // empty')"
         ;;
     esac
+    if [[ -z "${CONFIG_DATA['version']}" || "${CONFIG_DATA['version']}" == 'null' ]]; then
+        _error "failed to resolve Xray version"
+    fi
     # 更新脚本配置中的 Xray 版本
     SCRIPT_CONFIG="$(echo "${SCRIPT_CONFIG}" | jq --arg xray "${CONFIG_DATA['version']}" '.xray.version = $xray')"
     # 将更新后的脚本配置写入文件
-    echo "${SCRIPT_CONFIG}" >"${SCRIPT_CONFIG_PATH}" && sleep 2
+    persist_script_config
 }
 
 # =============================================================================
@@ -1539,7 +1617,7 @@ function handler_change_xray_port() {
     # 更新脚本配置中的 Xray 端口
     SCRIPT_CONFIG="$(echo "${SCRIPT_CONFIG}" | jq --argjson port "${XRAY_PORT}" '.xray.port = $port')"
     # 将更新后的脚本配置写入文件
-    echo "${SCRIPT_CONFIG}" >"${SCRIPT_CONFIG_PATH}" && sleep 2
+    persist_script_config
 }
 
 # =============================================================================
@@ -1561,16 +1639,20 @@ function handler_install() {
         handler_xray_version "${xray_version}"
     else
         # 否则从脚本配置中读取版本
-        CONFIG_DATA['version']="$(echo "${SCRIPT_CONFIG}" | jq -r '.xray.version')"
+        CONFIG_DATA['version']="$(echo "${SCRIPT_CONFIG}" | jq -r '.xray.version // empty')"
+    fi
+    # 若脚本配置中尚无版本号，自动解析最新 release 版本
+    if [[ -z "${CONFIG_DATA['version']}" || "${CONFIG_DATA['version']}" == 'null' ]]; then
+        handler_xray_version 'release'
     fi
     # 检查 Xray 命令是否存在，或是否强制安装
     if ! cmd_exists 'xray' || [[ "${force_install}" != n ]]; then
         # 调用 Xray-install 脚本进行安装
-        bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --version "${CONFIG_DATA['version']}" || _error "xray install failed"
+        run_xray_install_script install --version "${CONFIG_DATA['version']}" || _error "xray install failed"
     fi
-    # 写入 UDS 权限 Drop-in 并修正配置目录权限
+    # 写入 UDS 权限 Drop-in、补齐地理数据库并修正权限
     ensure_xray_uds_dropin
-    fix_xray_config_permissions
+    ensure_xray_geodata
 }
 
 # =============================================================================
@@ -1581,7 +1663,7 @@ function handler_install() {
 # =============================================================================
 function handler_purge() {
     # 调用 Xray-install 脚本进行卸载 (带 --purge 参数)
-    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove --purge
+    run_xray_install_script remove --purge || _error "xray purge failed"
     # 清理自定义 UDS Drop-in 配置
     rm -f "${XRAY_UDS_DROPIN_PATH}"
     rmdir "${XRAY_DROPIN_DIR}" 2>/dev/null || true
@@ -1589,7 +1671,7 @@ function handler_purge() {
     # 重置 xray 字段
     SCRIPT_CONFIG=$(reset_json_fields "${SCRIPT_CONFIG}" 'xray')
     # 将重置后的脚本配置写入文件
-    echo "${SCRIPT_CONFIG}" >"${SCRIPT_CONFIG_PATH}" && sleep 2
+    persist_script_config
 }
 
 # =============================================================================
@@ -1602,14 +1684,59 @@ function handler_purge() {
 # 参数: 无
 # 返回值: 无 (通过 systemctl 命令执行操作)
 # =============================================================================
+function print_service_msg() {
+    local color="$1"
+    local zh_msg="$2"
+    local en_msg="$3"
+    local title=""
+    if [[ "${color}" == "${YELLOW}" ]]; then
+        [[ -n "${I18N_DATA}" ]] && title="$(echo "$I18N_DATA" | jq -r '.title.tip // empty')"
+        [[ -z "${title}" ]] && title="$([[ "${CURRENT_LANG}" == "zh" ]] && echo "提示" || echo "Tips")"
+    else
+        [[ -n "${I18N_DATA}" ]] && title="$(echo "$I18N_DATA" | jq -r '.title.info // empty')"
+        [[ -z "${title}" ]] && title="$([[ "${CURRENT_LANG}" == "zh" ]] && echo "信息" || echo "Info")"
+    fi
+    if [[ "${CURRENT_LANG}" == "zh" ]]; then
+        printf '%b[%s]%b %s\n' "${color}" "${title}" "${NC}" "${zh_msg}" >&2
+    else
+        printf '%b[%s]%b %s\n' "${color}" "${title}" "${NC}" "${en_msg}" >&2
+    fi
+}
+
 function handler_start() {
+    if ! cmd_exists 'xray' && [[ ! -f /etc/systemd/system/xray.service ]]; then
+        if [[ "${CURRENT_LANG}" == "zh" ]]; then
+            _error "未检测到 Xray 服务，请先安装 Xray"
+        else
+            _error "Xray service not found, please install Xray first"
+        fi
+    fi
+
     ensure_xray_uds_dropin
-    fix_xray_config_permissions
+    ensure_xray_geodata
     systemctl -q reset-failed xray 2>/dev/null || true
-    # 检查 Xray 服务是否活跃，如果不活跃则启动
-    systemctl -q is-active xray || systemctl -q start xray
-    # 检查 Xray 服务是否已启用，如果未启用则启用
-    systemctl -q is-enabled xray || systemctl -q enable xray
+
+    local already_active=0
+    if systemctl -q is-active xray; then
+        already_active=1
+    else
+        systemctl start xray || {
+            if [[ "${CURRENT_LANG}" == "zh" ]]; then
+                _error "Xray 服务启动失败，请执行 systemctl status xray 查看日志"
+            else
+                _error "Failed to start Xray service, run 'systemctl status xray' for details"
+            fi
+        }
+    fi
+
+    # 检查 Xray 服务是否已启用，如果未启用则启用开机自启
+    systemctl -q is-enabled xray 2>/dev/null || systemctl -q enable xray 2>/dev/null || true
+
+    if [[ ${already_active} -eq 1 ]]; then
+        print_service_msg "${YELLOW}" "Xray 服务已在运行中 (active)" "Xray service is already running (active)"
+    else
+        print_service_msg "${GREEN}" "Xray 服务已启动并设为开机自启 (active)" "Xray service started and enabled (active)"
+    fi
 }
 
 # =============================================================================
@@ -1623,10 +1750,37 @@ function handler_start() {
 # 返回值: 无 (通过 systemctl 命令执行操作)
 # =============================================================================
 function handler_stop() {
+    if ! cmd_exists 'xray' && [[ ! -f /etc/systemd/system/xray.service ]]; then
+        if [[ "${CURRENT_LANG}" == "zh" ]]; then
+            _error "未检测到 Xray 服务，请先安装 Xray"
+        else
+            _error "Xray service not found, please install Xray first"
+        fi
+    fi
+
+    local was_active=0
     # 检查 Xray 服务是否活跃，如果活跃则停止
-    systemctl -q is-active xray && systemctl -q stop xray
-    # 检查 Xray 服务是否已启用，如果启用则禁用
-    systemctl -q is-enabled xray && systemctl -q disable xray
+    if systemctl -q is-active xray; then
+        was_active=1
+        systemctl stop xray || {
+            if [[ "${CURRENT_LANG}" == "zh" ]]; then
+                _error "Xray 服务停止失败，请执行 systemctl status xray 查看日志"
+            else
+                _error "Failed to stop Xray service, run 'systemctl status xray' for details"
+            fi
+        }
+    fi
+
+    # 检查 Xray 服务是否已启用，如果启用则禁用（已禁用时直接跳过，避免返回非 0 退出码）
+    if systemctl -q is-enabled xray 2>/dev/null; then
+        systemctl -q disable xray 2>/dev/null || true
+    fi
+
+    if [[ ${was_active} -eq 1 ]]; then
+        print_service_msg "${GREEN}" "Xray 服务已停止 (inactive)" "Xray service stopped (inactive)"
+    else
+        print_service_msg "${YELLOW}" "Xray 服务当前未运行 (inactive)" "Xray service is already stopped (inactive)"
+    fi
 }
 
 # =============================================================================
@@ -1640,13 +1794,41 @@ function handler_stop() {
 # 返回值: 无 (通过 systemctl 命令执行操作)
 # =============================================================================
 function handler_restart() {
+    if ! cmd_exists 'xray' && [[ ! -f /etc/systemd/system/xray.service ]]; then
+        if [[ "${CURRENT_LANG}" == "zh" ]]; then
+            _error "未检测到 Xray 服务，请先安装 Xray"
+        else
+            _error "Xray service not found, please install Xray first"
+        fi
+    fi
+
     ensure_xray_uds_dropin
-    fix_xray_config_permissions
+    ensure_xray_geodata
     systemctl -q reset-failed xray 2>/dev/null || true
+
     # 检查 Xray 服务是否活跃，如果活跃则重启，否则启动
-    systemctl -q is-active xray && systemctl -q restart xray || systemctl -q start xray
-    # 检查 Xray 服务是否已启用，如果未启用则启用
-    systemctl -q is-enabled xray || systemctl -q enable xray
+    if systemctl -q is-active xray; then
+        systemctl restart xray || {
+            if [[ "${CURRENT_LANG}" == "zh" ]]; then
+                _error "Xray 服务重启失败，请执行 systemctl status xray 查看日志"
+            else
+                _error "Failed to restart Xray service, run 'systemctl status xray' for details"
+            fi
+        }
+    else
+        systemctl start xray || {
+            if [[ "${CURRENT_LANG}" == "zh" ]]; then
+                _error "Xray 服务启动失败，请执行 systemctl status xray 查看日志"
+            else
+                _error "Failed to start Xray service, run 'systemctl status xray' for details"
+            fi
+        }
+    fi
+
+    # 检查 Xray 服务是否已启用，如果未启用则启用开机自启
+    systemctl -q is-enabled xray 2>/dev/null || systemctl -q enable xray 2>/dev/null || true
+
+    print_service_msg "${GREEN}" "Xray 服务已重启并运行中 (active)" "Xray service restarted and running (active)"
 }
 
 # =============================================================================
@@ -1687,11 +1869,11 @@ function handler_geodata_cron() {
     # 从脚本配置中检查 Xray 状态 (版本)
     local XRAY_STATUS="$(echo "${SCRIPT_CONFIG}" | jq -r '.xray.version')"
     # 如果 Xray 已安装
-    if ! [[ -z "${XRAY_STATUS}" ]]; then
+    if [[ -n "${XRAY_STATUS}" && "${XRAY_STATUS}" != 'null' ]]; then
         # 如果是快速模式
-        if (("${IS_QUICK}" == 0)) && crontab -l | grep -q "${GEODATA_PATH}"; then
+        if (("${IS_QUICK}" == 0)) && crontab -l 2>/dev/null | grep -q "${GEODATA_PATH}"; then
             # 移除现有的 GeoData Cron 任务
-            crontab -l | grep -v "${GEODATA_PATH}" | crontab -
+            (crontab -l 2>/dev/null | grep -v "${GEODATA_PATH}" || true) | crontab -
             # 打印关闭 Cron 任务的提示
             echo -e "${GREEN}[$(echo "$I18N_DATA" | jq -r '.title.tip')] ${NC}$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.geodata.close_cron")" >&2
         else
@@ -1699,13 +1881,14 @@ function handler_geodata_cron() {
             chmod a+x "${GEODATA_PATH}"
             # 添加新的 GeoData Cron 任务 (每天 6:30 执行)
             (
-                crontab -l 2>/dev/null
+                crontab -l 2>/dev/null || true
                 echo "30 6 * * * ${GEODATA_PATH} >/dev/null 2>&1"
             ) | awk '!x[$0]++' | crontab -
             # 打印开启 Cron 任务的提示
             echo -e "${GREEN}[$(echo "$I18N_DATA" | jq -r '.title.tip')] ${NC}$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.geodata.update")" >&2
-            # 立即执行一次 GeoData 更新
-            ${GEODATA_PATH}
+            # 立即执行一次 GeoData 更新并校准权限
+            bash "${GEODATA_PATH}" || _error "geodata update failed"
+            fix_xray_config_permissions
             # 打印已开启 Cron 任务的提示
             echo -e "${GREEN}[$(echo "$I18N_DATA" | jq -r '.title.tip')] ${NC}$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.geodata.open_cron")" >&2
         fi
@@ -1743,59 +1926,62 @@ function handler_warp() {
     # 确保 Docker 已安装
     handler_docker
     # 从脚本配置中读取当前 WARP 状态
-    local WARP_STATUS="$(echo "${SCRIPT_CONFIG}" | jq -r '.xray.warp')"
+    local WARP_STATUS="$(echo "${SCRIPT_CONFIG}" | jq -r '.xray.warp // 0')"
     # 从 Xray 配置文件加载配置
-    XRAY_CONFIG="$(jq '.' "${XRAY_CONFIG_PATH}")"
+    XRAY_CONFIG="$(jq '.' "${XRAY_CONFIG_PATH}")" || _error "failed to read Xray config"
     # 如果 WARP 已启用 (状态为 1)
-    if [[ ${WARP_STATUS} -eq 1 ]]; then
+    if [[ "${WARP_STATUS}" == "1" ]]; then
         WARP_STATUS=0 # 设置状态为禁用
         # 调用 docker.sh 禁用 WARP 容器
         exec_docker '--disable-warp'
         # 从 Xray 配置中删除 WARP 出站和相关路由规则
         XRAY_CONFIG=$(echo "${XRAY_CONFIG}" | jq 'del(.outbounds[] | select(.tag == "warp")) | del(.routing.rules[] | select(.outboundTag == "warp"))')
+        # 同步清理脚本配置中保存的路由规则，避免下次重建时残留无效 warp 规则
+        local updated_rules="$(echo "${XRAY_CONFIG}" | jq -c '.routing.rules')"
+        SCRIPT_CONFIG="$(echo "${SCRIPT_CONFIG}" | jq --argjson rules "${updated_rules}" '.rules = $rules')"
     else
         WARP_STATUS=1 # 设置状态为启用
         # 调用 docker.sh 构建并启用 WARP 容器
         exec_docker '--build-warp'
         local container_ip="$(exec_docker '--enable-warp')" # 获取 WARP 容器 IP
-        # 构造 WARP Socks 出站配置 JSON
+        [[ -n "${container_ip}" ]] || _error "failed to obtain WARP container IP"
+        # 构造 WARP Socks 出站配置 JSON（先去重再追加）
         local socks_config='[{"tag":"warp","protocol":"socks","settings":{"servers":[{"address":"'"${container_ip}"'","port":40001}]}}]'
-        # 将 WARP 出站配置添加到 Xray 配置中
-        XRAY_CONFIG=$(echo "${XRAY_CONFIG}" | jq --argjson socks_config "${socks_config}" '.outbounds += $socks_config')
+        XRAY_CONFIG=$(echo "${XRAY_CONFIG}" | jq --argjson socks_config "${socks_config}" 'del(.outbounds[] | select(.tag == "warp")) | .outbounds += $socks_config')
     fi
-    # 更新脚本配置中的 WARP 状态
-    SCRIPT_CONFIG=$(echo "${SCRIPT_CONFIG}" | jq --arg warp "${WARP_STATUS}" '.xray.warp = $warp')
+    # 更新脚本配置中的 WARP 状态（保持整数类型）
+    SCRIPT_CONFIG=$(echo "${SCRIPT_CONFIG}" | jq --argjson warp "${WARP_STATUS}" '.xray.warp = $warp')
     # 将更新后的脚本配置和 Xray 配置写入文件
-    echo "${SCRIPT_CONFIG}" >"${SCRIPT_CONFIG_PATH}" && sleep 2
+    persist_script_config
     persist_xray_config
 }
 
 # =============================================================================
 # 函数名称: handler_reset_warp
 # 功能描述: 重新构建并启动 WARP 容器。
-#           1. 确保 Docker 已安装。
-#           2. 检查当前 WARP 状态。
-#           3. 如果已启用，则执行清空容器日志，并重置 WARP 容器。
-#           4. 如果未启用，则跳过。
+#           1. 检查当前 WARP 状态，未启用时直接跳过（避免无谓安装 Docker）。
+#           2. 若已启用，清空容器日志、重建并同步更新最新容器 IP 到 Xray 配置。
 # 参数: 无
 # 返回值: 无 (通过调用其他函数和脚本执行操作)
 # =============================================================================
 function handler_reset_warp() {
-    # 确保 Docker 已安装
-    handler_docker
     # 从脚本配置中读取当前 WARP 状态
-    local WARP_STATUS="$(echo "${SCRIPT_CONFIG}" | jq -r '.xray.warp')"
-    # 从 Xray 配置文件加载配置
-    XRAY_CONFIG="$(jq '.' "${XRAY_CONFIG_PATH}")"
+    local WARP_STATUS="$(echo "${SCRIPT_CONFIG}" | jq -r '.xray.warp // 0')"
     # 如果 WARP 已启用 (状态为 1)
-    if [[ ${WARP_STATUS} -eq 1 ]]; then
+    if [[ "${WARP_STATUS}" == "1" ]]; then
+        # 确保 Docker 已安装
+        handler_docker
         # 清空 WARP 容器日志数据
         exec_docker '--clean-container-logs'
         # 调用 docker.sh 禁用 WARP 容器
         exec_docker '--disable-warp'
-        # 调用 docker.sh 构建并启用 WARP 容器
+        # 调用 docker.sh 构建并启用 WARP 容器，并获取重建后的容器 IP
         exec_docker '--build-warp'
-        exec_docker '--enable-warp'
+        local container_ip="$(exec_docker '--enable-warp')"
+        if [[ -n "${container_ip}" && -f "${XRAY_CONFIG_PATH}" ]]; then
+            XRAY_CONFIG="$(jq --arg ip "${container_ip}" '(.outbounds[] | select(.tag == "warp").settings.servers[0].address) |= $ip' "${XRAY_CONFIG_PATH}")"
+            persist_xray_config
+        fi
     fi
 }
 
@@ -1825,7 +2011,7 @@ function handler_nginx_install() {
         # 更新脚本配置中的 Nginx 版本
         SCRIPT_CONFIG=$(echo "${SCRIPT_CONFIG}" | jq --arg version "${NGINX_VERSION}" '.nginx.version = $version')
         # 将更新后的脚本配置写入文件
-        echo "${SCRIPT_CONFIG}" >"${SCRIPT_CONFIG_PATH}" && sleep 2 || _error "failed to persist nginx version"
+        persist_script_config || _error "failed to persist nginx version"
     fi
 }
 
@@ -1852,7 +2038,7 @@ function handler_nginx_purge() {
     # 重置 nginx 字段
     SCRIPT_CONFIG=$(reset_json_fields "${SCRIPT_CONFIG}" 'nginx')
     # 将重置后的脚本配置写入文件
-    echo "${SCRIPT_CONFIG}" >"${SCRIPT_CONFIG_PATH}" && sleep 2
+    persist_script_config
 }
 
 # =============================================================================
@@ -1869,11 +2055,11 @@ function handler_nginx_cron() {
     # 从脚本配置中检查 Nginx 状态 (版本)
     local NGINX_STATUS="$(echo "${SCRIPT_CONFIG}" | jq -r '.nginx.version')"
     # 如果 Nginx 已安装
-    if [[ -n "${NGINX_STATUS}" ]]; then
+    if [[ -n "${NGINX_STATUS}" && "${NGINX_STATUS}" != 'null' ]]; then
         # 检查是否存在 Nginx 更新的 Cron 任务
-        if crontab -l | grep -q "${NGINX_PATH}"; then
+        if crontab -l 2>/dev/null | grep -q "${NGINX_PATH}"; then
             # 移除现有的 Nginx Cron 任务
-            crontab -l | grep -v "${NGINX_PATH}" | crontab -
+            (crontab -l 2>/dev/null | grep -v "${NGINX_PATH}" || true) | crontab -
             # 打印关闭 Cron 任务的提示
             echo -e "${GREEN}[$(echo "$I18N_DATA" | jq -r '.title.tip')] ${NC}$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.nginx.close_cron")" >&2
         else
@@ -1881,7 +2067,7 @@ function handler_nginx_cron() {
             chmod a+x "${NGINX_PATH}"
             # 添加新的 Nginx 更新 Cron 任务 (每天 3:00 执行)
             (
-                crontab -l 2>/dev/null
+                crontab -l 2>/dev/null || true
                 echo "0 3 * * * ${NGINX_PATH} --update --brotli >/dev/null 2>&1"
             ) | awk '!x[$0]++' | crontab -
             # 打印开启 Cron 任务的提示
@@ -1987,65 +2173,71 @@ function handler_change_domain() {
     # 获取管理停止证书签发服务参数
     local stop_cert_service="${2:-y}"
     # 从脚本配置中获取旧域名
-    local old_domain="$(echo "${SCRIPT_CONFIG}" | jq -r --arg key "${target_domain}" '.nginx[$key]')"
+    local old_domain="$(echo "${SCRIPT_CONFIG}" | jq -r --arg key "${target_domain}" '.nginx[$key] // empty')"
     ensure_nginx_support_files || _error "failed to sync nginx support files"
     # 如果 CONFIG_DATA 中没有新域名，且 stop_cert_service 为 "y"，则读取用户输入
     if [[ -z "${CONFIG_DATA["${target_domain}"]}" && "${stop_cert_service}" == "y" ]]; then
-        [[ "${old_domain}" ]] && exec_read 'only-change-domain'
+        [[ -n "${old_domain}" ]] && exec_read 'only-change-domain'
         exec_read "${target_domain}"
     else
         CONFIG_DATA["${target_domain}"]="${old_domain}"
     fi
+    local new_domain="${CONFIG_DATA["${target_domain}"]}"
+    if [[ -z "${new_domain}" || "${new_domain}" == 'null' ]]; then
+        [[ "${stop_cert_service}" == "n" ]] && return 0
+        _error "empty target domain for ${target_domain}"
+    fi
     # 备份旧域名的 Nginx 配置文件
-    [[ -e ${NGINX_CONFIG_DIR}/modules-enabled/stream.conf ]] && cp -f ${NGINX_CONFIG_DIR}/modules-enabled/stream.conf ${SCRIPT_CONFIG_DIR}/stream.conf
-    if [[ -e ${NGINX_CONFIG_DIR}/sites-available/${old_domain}.conf ]]; then
-        cp -f ${NGINX_CONFIG_DIR}/sites-available/${old_domain}.conf ${SCRIPT_CONFIG_DIR}/${old_domain}.conf
+    [[ -f "${NGINX_CONFIG_DIR}/modules-enabled/stream.conf" ]] && cp -f "${NGINX_CONFIG_DIR}/modules-enabled/stream.conf" "${SCRIPT_CONFIG_DIR}/stream.conf"
+    if [[ -n "${old_domain}" && -f "${NGINX_CONFIG_DIR}/sites-available/${old_domain}.conf" ]]; then
+        cp -f "${NGINX_CONFIG_DIR}/sites-available/${old_domain}.conf" "${SCRIPT_CONFIG_DIR}/${old_domain}.conf"
         # 删除旧域名的 Nginx 配置文件
-        rm -rf ${NGINX_CONFIG_DIR}/sites-{available,enabled}/${old_domain}.conf
+        rm -f "${NGINX_CONFIG_DIR}/sites-available/${old_domain}.conf" "${NGINX_CONFIG_DIR}/sites-enabled/${old_domain}.conf"
     fi
     # 复制站点配置模板到 available 目录
-    cp -f "${CONFIG_DIR}/nginx/conf/sites-available/${target_domain}.example.com.conf" "${NGINX_CONFIG_DIR}/sites-available/${CONFIG_DATA["${target_domain}"]}.conf"
+    cp -f "${CONFIG_DIR}/nginx/conf/sites-available/${target_domain}.example.com.conf" "${NGINX_CONFIG_DIR}/sites-available/${new_domain}.conf"
     # 替换配置文件中的 example.com 为实际域名
-    sed -i "s|example.com|${CONFIG_DATA["${target_domain}"]}|g" "${NGINX_CONFIG_DIR}/sites-available/${CONFIG_DATA["${target_domain}"]}.conf"
+    sed -i "s|example\.com|${new_domain}|g" "${NGINX_CONFIG_DIR}/sites-available/${new_domain}.conf"
     # 替换配置文件中的 /yourpath 为 xhttp path
-    sed -i "s|/yourpath|${XHTTP_PATH}|g" "${NGINX_CONFIG_DIR}/sites-available/${CONFIG_DATA["${target_domain}"]}.conf"
+    sed -i "s|/yourpath|${XHTTP_PATH}|g" "${NGINX_CONFIG_DIR}/sites-available/${new_domain}.conf"
     # 创建从 available 到 enabled 的软链接
-    ln -sf "${NGINX_CONFIG_DIR}/sites-available/${CONFIG_DATA["${target_domain}"]}.conf" "${NGINX_CONFIG_DIR}/sites-enabled/${CONFIG_DATA["${target_domain}"]}.conf"
+    ln -sf "${NGINX_CONFIG_DIR}/sites-available/${new_domain}.conf" "${NGINX_CONFIG_DIR}/sites-enabled/${new_domain}.conf"
     # 为新域名申请 SSL 证书
-    if exec_ssl '--issue' --domain=${CONFIG_DATA["${target_domain}"]}; then
-        # 如果旧域名存在
-        if [[ -n "${old_domain}" && "${stop_cert_service}" == "y" ]] && exec_ssl '--status' --domain=${old_domain}; then
-            # 停止旧域名的证书续签
-            exec_ssl '--stop-renew' --domain=${old_domain}
+    if exec_ssl '--issue' "--domain=${new_domain}"; then
+        # 如果旧域名存在且与新域名不同，则停止旧域名的证书续签
+        if [[ -n "${old_domain}" && "${old_domain}" != "${new_domain}" && "${stop_cert_service}" == "y" ]] && exec_ssl '--status' "--domain=${old_domain}"; then
+            exec_ssl '--stop-renew' "--domain=${old_domain}"
         fi
     else
         # 删除新配置
-        rm -rf ${NGINX_CONFIG_DIR}/sites-{available,enabled}/${CONFIG_DATA["${target_domain}"]}.conf
-        # 恢复备份的 Nginx 配置文件
-        mv -f ${SCRIPT_CONFIG_DIR}/stream.conf ${NGINX_CONFIG_DIR}/modules-enabled/stream.conf
-        mv -f ${SCRIPT_CONFIG_DIR}/${old_domain}.conf ${NGINX_CONFIG_DIR}/sites-available/${old_domain}.conf
-        ln -sf ${NGINX_CONFIG_DIR}/sites-available/${old_domain}.conf ${NGINX_CONFIG_DIR}/sites-enabled/${old_domain}.conf
+        rm -f "${NGINX_CONFIG_DIR}/sites-available/${new_domain}.conf" "${NGINX_CONFIG_DIR}/sites-enabled/${new_domain}.conf"
+        # 仅在备份存在时恢复旧的 Nginx 配置文件，避免首次配置失败时产生坏软链
+        [[ -f "${SCRIPT_CONFIG_DIR}/stream.conf" ]] && mv -f "${SCRIPT_CONFIG_DIR}/stream.conf" "${NGINX_CONFIG_DIR}/modules-enabled/stream.conf"
+        if [[ -n "${old_domain}" && -f "${SCRIPT_CONFIG_DIR}/${old_domain}.conf" ]]; then
+            mv -f "${SCRIPT_CONFIG_DIR}/${old_domain}.conf" "${NGINX_CONFIG_DIR}/sites-available/${old_domain}.conf"
+            ln -sf "${NGINX_CONFIG_DIR}/sites-available/${old_domain}.conf" "${NGINX_CONFIG_DIR}/sites-enabled/${old_domain}.conf"
+        fi
         # 重启或启动 Nginx
-        handler_nginx_restart
+        handler_nginx_restart || true
         exit 1
     fi
-    # 更新脚本配置中的域名
-    SCRIPT_CONFIG="$(echo "${SCRIPT_CONFIG}" | jq --arg key "${target_domain}" --arg domain "${CONFIG_DATA["${target_domain}"]}" '.nginx[$key] = $domain')"
-    SCRIPT_CONFIG="$(echo "${SCRIPT_CONFIG}" | jq --arg key "${target_domain}" --arg domain "${old_domain}" 'if $key == "domain" then del(.target[$key]) else . end')"
-    SCRIPT_CONFIG="$(echo "${SCRIPT_CONFIG}" | jq --arg key "${target_domain}" --arg domain "${CONFIG_DATA["${target_domain}"]}" 'if $key == "domain" then .xray.target = $domain else . end')"
-    SCRIPT_CONFIG="$(echo "${SCRIPT_CONFIG}" | jq --arg key "${target_domain}" --arg domain "${CONFIG_DATA["${target_domain}"]}" 'if $key == "domain" then .xray.serverNames = [$domain] else . end')"
+    # 更新脚本配置中的域名（修复原 del(.target[$key]) 未删除旧域名键的 bug）
+    SCRIPT_CONFIG="$(echo "${SCRIPT_CONFIG}" | jq --arg key "${target_domain}" --arg domain "${new_domain}" '.nginx[$key] = $domain')"
+    if [[ "${target_domain}" == "domain" && -n "${old_domain}" && "${old_domain}" != "${new_domain}" ]]; then
+        SCRIPT_CONFIG="$(echo "${SCRIPT_CONFIG}" | jq --arg oldDomain "${old_domain}" 'if (.target | type) == "object" then del(.target[$oldDomain]) else . end')"
+    fi
+    SCRIPT_CONFIG="$(echo "${SCRIPT_CONFIG}" | jq --arg key "${target_domain}" --arg domain "${new_domain}" 'if $key == "domain" then .xray.target = $domain | .xray.serverNames = [$domain] else . end')"
     rebuild_stream_config "${SCRIPT_CONFIG}"
     # 将更新后的脚本配置写入文件
     persist_script_config
-    # 如果仅更新域名
-    if [[ "${CONFIG_DATA['only-change-domain'],,}" == "y" ]]; then
-        # 恢复备份的 Nginx 配置文件
-        mv -f ${SCRIPT_CONFIG_DIR}/${old_domain}.conf ${NGINX_CONFIG_DIR}/sites-available/${CONFIG_DATA["${target_domain}"]}.conf
-        rm -rf "${NGINX_CONFIG_DIR}/sites-enabled/${CONFIG_DATA["${target_domain}"]}.conf"
-        # 更新域名
-        sed -i "s|${old_domain}|${CONFIG_DATA["${target_domain}"]}|g" "${NGINX_CONFIG_DIR}/sites-available/${CONFIG_DATA["${target_domain}"]}.conf"
-        # 创建从 available 到 enabled 的软链接
-        ln -sf "${NGINX_CONFIG_DIR}/sites-available/${CONFIG_DATA["${target_domain}"]}.conf" "${NGINX_CONFIG_DIR}/sites-enabled/${CONFIG_DATA["${target_domain}"]}.conf"
+    # 如果仅更新域名且存在旧站点配置备份
+    if [[ "${CONFIG_DATA['only-change-domain'],,}" == "y" && -n "${old_domain}" && -f "${SCRIPT_CONFIG_DIR}/${old_domain}.conf" ]]; then
+        # 恢复备份的 Nginx 配置文件并精确替换旧域名
+        local old_domain_escaped="${old_domain//./\.}"
+        mv -f "${SCRIPT_CONFIG_DIR}/${old_domain}.conf" "${NGINX_CONFIG_DIR}/sites-available/${new_domain}.conf"
+        rm -f "${NGINX_CONFIG_DIR}/sites-enabled/${new_domain}.conf"
+        sed -i "s|${old_domain_escaped}|${new_domain}|g" "${NGINX_CONFIG_DIR}/sites-available/${new_domain}.conf"
+        ln -sf "${NGINX_CONFIG_DIR}/sites-available/${new_domain}.conf" "${NGINX_CONFIG_DIR}/sites-enabled/${new_domain}.conf"
         rebuild_stream_config "${SCRIPT_CONFIG}"
     fi
     # 重启或启动 Nginx
@@ -2097,6 +2289,10 @@ function handler_nginx_config() {
 # 返回值: 无 (通过调用 docker.sh 脚本执行操作)
 # =============================================================================
 function handler_cloudreve_v3() {
+    # 若仅需停止或卸载且系统尚未安装 Docker，直接跳过，避免安装非 SNI / normal 模式时误装 Docker
+    if [[ "${1}" == "stop" || "${1}" == "purge" ]] && ! cmd_exists 'docker'; then
+        return 0
+    fi
     # 确保 Docker 已安装
     handler_docker
     # 根据传入的操作参数执行对应动作
@@ -2114,13 +2310,17 @@ function handler_cloudreve_v3() {
 # =============================================================================
 # 函数名称: handler_cloudreve_v4
 # 功能描述: 管理 Cloudreve v4 Docker 容器。
-#           1. 确保 Docker 已安装。
+#           1. 停止/卸载时若未安装 Docker 直接跳过；其余操作确保 Docker 已安装。
 #           2. 根据传入参数调用 docker.sh 执行对应操作。
 # 参数:
 #   $1: action - 要执行的操作 (install, update, purge, start, stop)
 # 返回值: 无 (通过调用 docker.sh 脚本执行操作)
 # =============================================================================
 function handler_cloudreve_v4() {
+    # 若仅需停止或卸载且系统尚未安装 Docker，直接跳过，避免安装非 SNI / normal 模式时误装 Docker
+    if [[ "${1}" == "stop" || "${1}" == "purge" ]] && ! cmd_exists 'docker'; then
+        return 0
+    fi
     # 确保 Docker 已安装
     handler_docker
     # 根据传入的操作参数执行对应动作
@@ -2148,8 +2348,8 @@ function handler_cloudreve_v4() {
 function handler_web() {
     local web="${1:-normal}" # 获取 Web 类型参数，默认为 normal
     # 从脚本配置中读取域名和 CDN
-    local domain="$(echo "${SCRIPT_CONFIG}" | jq -r '.nginx.domain')"
-    local cdn="$(echo "${SCRIPT_CONFIG}" | jq -r '.nginx.cdn')"
+    local domain="$(echo "${SCRIPT_CONFIG}" | jq -r '.nginx.domain // empty')"
+    local cdn="$(echo "${SCRIPT_CONFIG}" | jq -r '.nginx.cdn // empty')"
     # 根据 Web 类型启动/停止 Cloudreve 容器
     case "${web}" in
     v3)
@@ -2168,19 +2368,25 @@ function handler_web() {
         handler_cloudreve_v4 'stop'
         ;;
     esac
-    # 根据 Web 类型修改 Nginx 配置以包含或排除 Cloudreve
+    # 根据 Web 类型幂等地修改 Nginx 配置以包含或排除 Cloudreve
+    local domain_conf="${NGINX_CONFIG_DIR}/sites-available/${domain}.conf"
+    local cdn_conf="${NGINX_CONFIG_DIR}/sites-available/${cdn}.conf"
     case "${web}" in
     v3 | v4)
-        # 启用 Cloudreve 配置 (取消注释)
-        sed -i "s|# include web/cloudreve.conf;|include web/cloudreve.conf;|" "${NGINX_CONFIG_DIR}/sites-available/${domain}.conf"
-        sed -i "s|# include web/cloudreve.conf;|include web/cloudreve.conf;|" "${NGINX_CONFIG_DIR}/sites-available/${cdn}.conf"
-        sed -i "s|include web/normal.conf;|# include web/normal.conf;|" "${NGINX_CONFIG_DIR}/sites-available/${cdn}.conf"
+        # 启用 Cloudreve 配置 (取消注释)，注释 normal 配置
+        [[ -n "${domain}" && -f "${domain_conf}" ]] && sed -i -E 's|^([[:space:]]*)#([[:space:]]*)include web/cloudreve\.conf;|\1include web/cloudreve.conf;|' "${domain_conf}"
+        if [[ -n "${cdn}" && -f "${cdn_conf}" ]]; then
+            sed -i -E 's|^([[:space:]]*)#([[:space:]]*)include web/cloudreve\.conf;|\1include web/cloudreve.conf;|' "${cdn_conf}"
+            sed -i -E 's|^([[:space:]]*)include web/normal\.conf;|\1# include web/normal.conf;|' "${cdn_conf}"
+        fi
         ;;
     *)
-        # 禁用 Cloudreve 配置 (添加注释)
-        sed -i "s|[^#] include web/cloudreve.conf;|  # include web/cloudreve.conf;|" "${NGINX_CONFIG_DIR}/sites-available/${domain}.conf"
-        sed -i "s|[^#] include web/cloudreve.conf;|  # include web/cloudreve.conf;|" "${NGINX_CONFIG_DIR}/sites-available/${cdn}.conf"
-        sed -i "s|# include web/normal.conf;|include web/normal.conf;|" "${NGINX_CONFIG_DIR}/sites-available/${cdn}.conf"
+        # 禁用 Cloudreve 配置 (添加注释)，恢复 normal 配置
+        [[ -n "${domain}" && -f "${domain_conf}" ]] && sed -i -E 's|^([[:space:]]*)include web/cloudreve\.conf;|\1# include web/cloudreve.conf;|' "${domain_conf}"
+        if [[ -n "${cdn}" && -f "${cdn_conf}" ]]; then
+            sed -i -E 's|^([[:space:]]*)include web/cloudreve\.conf;|\1# include web/cloudreve.conf;|' "${cdn_conf}"
+            sed -i -E 's|^([[:space:]]*)#([[:space:]]*)include web/normal\.conf;|\1include web/normal.conf;|' "${cdn_conf}"
+        fi
         ;;
     esac
     # 重启或启动 Nginx 与 xray 服务
@@ -2189,7 +2395,7 @@ function handler_web() {
     # 更新脚本配置中的 Web 类型
     SCRIPT_CONFIG="$(echo "${SCRIPT_CONFIG}" | jq --arg web "${web}" '.nginx.web = $web')"
     # 将更新后的脚本配置写入文件
-    echo "${SCRIPT_CONFIG}" >"${SCRIPT_CONFIG_PATH}" && sleep 2
+    persist_script_config
 }
 
 # =============================================================================
@@ -2219,7 +2425,7 @@ function handler_quick_install() {
     # 添加默认的阻止规则
     add_rule "bt" "protocol" "bittorrent" "block" 1
     add_rule "cn-domain" "domain" "geosite:cn" "block" "after" "private-ip"
-    add_rule "cn-ip" "ip" "geoip:cn" "block" "after" "private-ip"
+    add_rule "cn-ip" "ip" "geoip:cn" "block" "after" "cn-domain"
     add_rule "ad-domain" "domain" "geosite:category-ads-all" "block"
     # 更新 GeoData 并设置 Cron 任务 (快速模式)
     handler_geodata_cron 1
@@ -2295,6 +2501,7 @@ function main() {
     --start) handler_start ;;     # 启动 Xray
     --stop) handler_stop ;;       # 停止 Xray
     --restart) handler_restart ;; # 重启 Xray
+    *) _error "unsupported option: ${option}" ;;
     esac
 }
 

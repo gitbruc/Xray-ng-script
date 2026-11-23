@@ -5,7 +5,7 @@
 # Xray-script:
 #   https://github.com/zxcvos/Xray-script
 # =============================================================================
-# 注释: 通过 Qwen3-Coder 生成。
+# 注释: 通过 Gemini-Neon 生成。
 # 脚本名称: check.sh
 # 功能描述: 提供一系列验证函数，用于检查 IP、端口、UUID、密码、路径、Short ID、
 #           域名安全性、DNS 解析、Xray 配置/版本以及邮箱地址的有效性。
@@ -50,7 +50,7 @@ readonly DOMAIN_REGEX="^([a-zA-Z0-9]([-a-zA-Z0-9]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]
 readonly IPV4_REGEX='^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$' # IPv4
 readonly IPV6_REGEX='^([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}$'                                            # IPv6 (简化版)
 readonly HEX_REGEX='^[0-9a-fA-F]+$'                                                                         # 十六进制字符串
-readonly UUID_REGEX='^[0-9a-fA-F]{8}\b-[0-9a-fA-F]{4}\b-[0-9a-fA-F]{4}\b-[0-9a-fA-F]{4}\b-[0-9a-fA-F]{12}$' # UUID
+readonly UUID_REGEX='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' # UUID
 readonly EMAIL_REGEX='^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'                                     # 邮箱地址
 
 # --- 全局变量声明 ---
@@ -71,11 +71,19 @@ declare I18N_DATA=''  # 存储从 i18n JSON 文件中读取的全部数据
 # =============================================================================
 function load_i18n() {
     # 从配置文件中读取语言设置
-    local lang="$(jq -r '.language' "${SCRIPT_CONFIG_PATH}")"
+    local lang=""
+    if [[ -f "${SCRIPT_CONFIG_PATH}" ]]; then
+        lang="$(jq -r '.language // "auto"' "${SCRIPT_CONFIG_PATH}" 2>/dev/null)"
+    fi
+    [[ -z "${lang}" || "${lang}" == "null" ]] && lang="auto"
 
     # 如果语言设置为 "auto"，则使用系统环境变量 LANG 的第一部分作为语言代码
     if [[ "$lang" == "auto" ]]; then
-        lang=$(echo "$LANG" | cut -d'_' -f1)
+        lang="${LANG%%_*}"
+        lang="${lang%%.*}"
+        case "${lang}" in
+        "" | C | POSIX) lang="en" ;;
+        esac
     fi
 
     # 构造 i18n 文件的完整路径
@@ -106,7 +114,7 @@ function load_i18n() {
 # =============================================================================
 function _info() {
     # 从 i18n 数据中读取 "信息" 标题，然后用黄色打印消息
-    printf "${YELLOW}[$(echo "$I18N_DATA" | jq -r '.title.info')]${NC} %s\n" "$1" >&2
+    printf '%b[%s]%b %s\n' "${YELLOW}" "$(echo "$I18N_DATA" | jq -r '.title.info')" "${NC}" "$1" >&2
 }
 
 # =============================================================================
@@ -118,7 +126,7 @@ function _info() {
 # =============================================================================
 function _pass() {
     # 从 i18n 数据中读取 "通过" 标题，然后用绿色打印消息
-    printf "${GREEN}[$(echo "$I18N_DATA" | jq -r '.title.pass')]${NC} %s\n" "$1" >&2
+    printf '%b[%s]%b %s\n' "${GREEN}" "$(echo "$I18N_DATA" | jq -r '.title.pass')" "${NC}" "$1" >&2
 }
 
 # =============================================================================
@@ -130,7 +138,7 @@ function _pass() {
 # =============================================================================
 function _fail() {
     # 从 i18n 数据中读取 "失败" 标题，然后用红色打印消息
-    printf "${RED}[$(echo "$I18N_DATA" | jq -r '.title.fail')]${NC} %s\n" "$1" >&2
+    printf '%b[%s]%b %s\n' "${RED}" "$(echo "$I18N_DATA" | jq -r '.title.fail')" "${NC}" "$1" >&2
 }
 
 # =============================================================================
@@ -142,7 +150,7 @@ function _fail() {
 # =============================================================================
 function _test() {
     # 从 i18n 数据中读取 "测试" 标题，然后用黄色打印消息
-    printf "${YELLOW}[$(echo "$I18N_DATA" | jq -r '.title.test')]${NC} %s\n" "$1" >&2
+    printf '%b[%s]%b %s\n' "${YELLOW}" "$(echo "$I18N_DATA" | jq -r '.title.test')" "${NC}" "$1" >&2
 }
 
 # =============================================================================
@@ -184,15 +192,105 @@ function valid_domain() {
 #   $1: 待解析的域名 (domain)
 # 返回值: 0-解析成功 1-解析失败或无记录
 # =============================================================================
-function resolve_domain() {
-    # 使用 dig +short 命令解析域名，并将输出通过管道传递给 grep
-    # 如果 grep 能在输出中找到至少一个 '.' 字符（通常是 IP 地址的一部分），则返回 0
-    # 否则返回 1
-    if dig +short "$1" | grep -q '.'; then
-        return 0
-    else
-        return 1
+function valid_ipv6() {
+    local ip="$1"
+    [[ -n "${ip}" ]] || return 1
+    [[ "${ip}" == *:* ]] || return 1
+    [[ "${ip}" =~ ^[0-9a-fA-F:]+$ ]] || return 1
+    [[ "${ip}" == *:::* ]] && return 1
+    [[ "${ip}" =~ ^:[^:] || "${ip}" =~ [^:]:$ ]] && return 1
+
+    local group=''
+    local count=0
+    local -a parts=()
+
+    if [[ "${ip}" == *::* ]]; then
+        local rest="${ip#*::}"
+        # :: 最多只能出现一次
+        [[ "${rest}" == *::* ]] && return 1
+        local left="${ip%%::*}"
+        local right="${rest}"
+        if [[ -n "${left}" ]]; then
+            IFS=':' read -r -a parts <<<"${left}"
+            for group in "${parts[@]}"; do
+                [[ "${group}" =~ ^[0-9a-fA-F]{1,4}$ ]] || return 1
+                ((++count))
+            done
+        fi
+        if [[ -n "${right}" ]]; then
+            IFS=':' read -r -a parts <<<"${right}"
+            for group in "${parts[@]}"; do
+                [[ "${group}" =~ ^[0-9a-fA-F]{1,4}$ ]] || return 1
+                ((++count))
+            done
+        fi
+        ((count < 8))
+        return $?
     fi
+
+    IFS=':' read -r -a parts <<<"${ip}"
+    ((${#parts[@]} == 8)) || return 1
+    for group in "${parts[@]}"; do
+        [[ "${group}" =~ ^[0-9a-fA-F]{1,4}$ ]] || return 1
+    done
+    return 0
+}
+
+function normalize_ipv6() {
+    local ip="$1"
+    if cmd_exists 'python3'; then
+        python3 -c 'import ipaddress, sys; print(ipaddress.IPv6Address(sys.argv[1]).compressed)' "${ip}" 2>/dev/null && return 0
+    fi
+    printf '%s\n' "${ip,,}"
+}
+
+function get_server_ip() {
+    local family="$1" # 4 或 6
+    local url=''
+    local ip=''
+    local -a urls=()
+
+    if [[ "${family}" == "4" ]]; then
+        urls=("https://ipv4.icanhazip.com" "https://api4.ipify.org" "https://ip.sb")
+    else
+        urls=("https://ipv6.icanhazip.com" "https://api6.ipify.org" "https://ip.sb")
+    fi
+
+    for url in "${urls[@]}"; do
+        ip="$(curl "-${family}" -fsSL --connect-timeout 5 --max-time 10 "${url}" 2>/dev/null | tr -d '[:space:]')" || true
+        if [[ "${family}" == "4" && "${ip}" =~ ${IPV4_REGEX} ]]; then
+            printf '%s\n' "${ip}"
+            return 0
+        elif [[ "${family}" == "6" ]] && valid_ipv6 "${ip}"; then
+            printf '%s\n' "${ip}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+function resolve_domain() {
+    local domain="$1"
+    local records=''
+    local line=''
+
+    # 同时查询 A 和 AAAA 记录，兼容纯 IPv6 目标并过滤 dig 错误注释行
+    records="$(
+        {
+            dig +short +time=5 +tries=2 A "${domain}" 2>/dev/null
+            dig +short +time=5 +tries=2 AAAA "${domain}" 2>/dev/null
+        } | grep -v '^;'
+    )"
+
+    while IFS= read -r line; do
+        line="$(printf '%s' "${line}" | tr -d '[:space:]')"
+        [[ -z "${line}" ]] && continue
+        if [[ "${line}" =~ ${IPV4_REGEX} ]] || valid_ipv6 "${line}"; then
+            return 0
+        fi
+    done <<<"${records}"
+
+    return 1
 }
 
 # =============================================================================
@@ -204,22 +302,36 @@ function resolve_domain() {
 # 返回值: 0-至少有一个 IP 匹配 1-都不匹配
 # =============================================================================
 function dns_resolution() {
-    local domain=$1 # 获取域名参数
+    local domain="$1" # 获取域名参数
 
-    # 获取当前服务器的公网 IPv4 和 IPv6 地址
-    local expected_ipv4="$(curl -fsSL ipv4.icanhazip.com)"
-    local expected_ipv6="$(curl -fsSL ipv6.icanhazip.com)"
+    # 获取当前服务器的公网 IPv4 和 IPv6 地址（带超时与多源回退）
+    local expected_ipv4="$(get_server_ip 4 || true)"
+    local expected_ipv6="$(get_server_ip 6 || true)"
 
     local resolved=0 # 初始化标志变量，表示是否匹配
+    local line=''
 
-    # 解析域名的 IPv4 和 IPv6 记录
-    local actual_ipv4="$(dig +short "${domain}")"
-    local actual_ipv6="$(dig +short AAAA "${domain}")"
+    # 仅在成功获取到服务器 IPv4 时精确比对 A 记录，避免空串导致正则恒为真
+    if [[ -n "${expected_ipv4}" ]]; then
+        local actual_ipv4="$(dig +short +time=5 +tries=2 A "${domain}" 2>/dev/null | grep -v '^;')"
+        if printf '%s\n' "${actual_ipv4}" | grep -Fxq -- "${expected_ipv4}"; then
+            resolved=1
+        fi
+    fi
 
-    # 检查解析到的 IPv4 是否包含服务器的 IPv4
-    if [[ ${actual_ipv4} =~ ${expected_ipv4} ]]; then resolved=1; fi
-    # 检查解析到的 IPv6 是否包含服务器的 IPv6
-    if [[ ${actual_ipv6} =~ ${expected_ipv6} ]]; then resolved=1; fi
+    # 仅在成功获取到服务器 IPv6 时归一化并精确比对 AAAA 记录
+    if [[ ${resolved} -eq 0 && -n "${expected_ipv6}" ]]; then
+        local expected_ipv6_norm="$(normalize_ipv6 "${expected_ipv6}")"
+        local actual_ipv6="$(dig +short +time=5 +tries=2 AAAA "${domain}" 2>/dev/null | grep -v '^;')"
+        while IFS= read -r line; do
+            line="$(printf '%s' "${line}" | tr -d '[:space:]')"
+            [[ -z "${line}" ]] && continue
+            if valid_ipv6 "${line}" && [[ "$(normalize_ipv6 "${line}")" == "${expected_ipv6_norm}" ]]; then
+                resolved=1
+                break
+            fi
+        done <<<"${actual_ipv6}"
+    fi
 
     # 根据 resolved 标志返回结果
     [[ ${resolved} -eq 1 ]]
@@ -228,17 +340,21 @@ function dns_resolution() {
 # =============================================================================
 # 函数名称: test_tcp_connection
 # 功能描述: 测试到指定主机和端口的 TCP 连接是否可达。
-#           利用 bash 内建的 /dev/tcp 特性。
+#           利用 bash 内建的 /dev/tcp 特性（带超时限制防止黑洞端口长时间卡死）。
 # 参数:
 #   $1: 主机名或 IP 地址 (host)
 #   $2: 端口号 (port)
 # 返回值: 0-连接成功 1-连接失败 (由 /dev/tcp 操作的退出码决定)
 # =============================================================================
 function test_tcp_connection() {
-    # 尝试打开到 host:port 的 TCP 连接，将输出重定向到 /dev/null
-    # 成功则返回 0，失败（如连接被拒绝、超时）则返回非 0
-    echo >/dev/tcp/"$1"/"$2" 2>/dev/null
-    return $? # 返回上一条命令的退出码
+    local host="$1"
+    local port="$2"
+    if cmd_exists 'timeout'; then
+        timeout 5 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "${host}" "${port}" 2>/dev/null
+    else
+        exec 3<>"/dev/tcp/${host}/${port}" 2>/dev/null && exec 3>&-
+    fi
+    return $?
 }
 
 # =============================================================================
@@ -266,7 +382,7 @@ function get_listening_process_by_port() {
 function check_firewall_tcp_port_open() {
     local port="$1"
     if cmd_exists 'ufw' && ufw status 2>/dev/null | grep -q '^Status: active'; then
-        ufw status 2>/dev/null | grep -Eiq "^${port}(/tcp)?[[:space:]]+ALLOW"
+        ufw status 2>/dev/null | grep -Eiq "^${port}(/tcp)?([[:space:]]+\(v6\))?[[:space:]]+ALLOW"
         return $?
     fi
     if cmd_exists 'firewall-cmd' && cmd_exists 'systemctl' && systemctl -q is-active firewalld; then
@@ -390,10 +506,12 @@ function check_sni_ports() {
 # 注意: 会过滤掉空字节 (\0)
 # =============================================================================
 function get_tls_info() {
-    # 向域名的 443 端口发起 TLS 1.3 连接请求，并指定 ALPN 为 h2
-    # 使用 echo QUIT 发送退出命令，stdbuf -oL 确保输出行缓冲
-    # 2>&1 将错误输出合并到标准输出，tr -d '\0' 过滤掉空字节
-    echo QUIT | stdbuf -oL openssl s_client -connect "${1}:443" -tls1_3 -alpn h2 2>&1 | tr -d '\0'
+    # 向域名的 443 端口发起带 SNI (-servername) 的 TLS 1.3 连接请求，并指定 ALPN 为 h2
+    # 增加超时限制避免目标无响应时卡死，tr -d '\0' 过滤掉空字节
+    local -a cmd=(openssl s_client -connect "${1}:443" -servername "${1}" -tls1_3 -alpn h2)
+    cmd_exists 'stdbuf' && cmd=(stdbuf -oL "${cmd[@]}")
+    cmd_exists 'timeout' && cmd=(timeout 10 "${cmd[@]}")
+    echo QUIT | "${cmd[@]}" 2>&1 | tr -d '\0'
 }
 
 # =============================================================================
@@ -414,7 +532,7 @@ function check_ip() {
         _pass "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.ip.ipv4_valid")$ip"
         return 0
     # 使用正则表达式检查 IPv6 格式
-    elif [[ "$ip" =~ $IPV6_REGEX ]]; then
+    elif valid_ipv6 "$ip"; then
         _pass "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.ip.ipv6_valid")$ip"
         return 0
     else
@@ -441,7 +559,7 @@ function check_port() {
     if [[ -z "${port}" ]]; then
         _pass "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.port.empty")"
     # 检查端口号是否在 1-65535 范围内
-    elif [[ "${port}" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)); then
+    elif [[ "${port}" =~ ^[1-9][0-9]*$ ]] && ((10#${port} >= 1 && 10#${port} <= 65535)); then
         _pass "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.port.valid")$port"
     else
         # 如果超出范围，则为无效
@@ -498,7 +616,7 @@ function check_password() {
     fi
 
     # 检查密码中是否包含空格
-    if [[ "${password}" =~ *\ * ]]; then
+    if [[ "${password}" =~ [[:space:]] ]]; then
         _fail "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.password.space_error")$password"
         return 1
     fi
@@ -534,7 +652,7 @@ function check_path() {
     fi
 
     # 检查路径中是否包含空格
-    if [[ "${path}" =~ *\ * ]]; then
+    if [[ "${path}" =~ [[:space:]] ]]; then
         _fail "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.path.space_error")$path"
         return 1
     fi
@@ -639,7 +757,7 @@ function check_domain_security() {
     # 测试到域名 443 端口的 TCP 连接
     _test "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.tcp.connect_check"): ${domain}:443"
     if ! test_tcp_connection "$domain" 443; then
-        _fail "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.tcp.connect_fail" | sed "s/\${domain}/${domain}/")"
+        _fail "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.tcp.connect_fail" | sed "s|\${domain}|${domain}|g")"
         return 1
     fi
 
@@ -665,7 +783,7 @@ function check_domain_security() {
     fi
 
     # 如果所有检查都通过，则域名安全检查通过
-    _pass "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.domain.security_pass" | sed "s/\${domain}/${domain}/")"
+    _pass "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.domain.security_pass" | sed "s|\${domain}|${domain}|g")"
     return 0
 }
 
@@ -696,7 +814,7 @@ function check_dns_resolution() {
     fi
 
     # 如果解析正确，则检查通过
-    _pass "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.dns.check_pass" | sed "s/\${domain}/${domain}/")"
+    _pass "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.dns.check_pass" | sed "s|\${domain}|${domain}|g")"
     return 0
 }
 
@@ -734,15 +852,21 @@ function check_xray_config_exists() {
 # =============================================================================
 function check_xray_version_exists() {
     local version="$1" # 获取版本号参数
+    local normalized_version="${version#v}"
+
+    if [[ -z "${normalized_version}" ]]; then
+        _fail "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.version.not_exist")${version}"
+        return 1
+    fi
 
     # 打印正在检查的信息
-    _info "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.version.check")v${version}"
+    _info "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.version.check")v${normalized_version}"
 
     # 构造 GitHub Releases 页面的 URL
-    local version_url="https://github.com/XTLS/Xray-core/releases/tag/v${version#*v}"
+    local version_url="https://github.com/XTLS/Xray-core/releases/tag/v${normalized_version}"
 
-    # 使用 curl 获取页面的 HTTP 状态码
-    local status_code=$(curl -L -o /dev/null -s -w '%{http_code}\n' "$version_url")
+    # 使用 curl 获取页面的 HTTP 状态码（带连接与总超时）
+    local status_code="$(curl -L --connect-timeout 10 --max-time 20 -o /dev/null -s -w '%{http_code}' "$version_url")"
 
     # 检查状态码是否为 200 (OK)
     if [[ "$status_code" == "200" ]]; then
@@ -915,7 +1039,7 @@ function check_list_index() {
 
     _info "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.list_index.check")${index}"
 
-    if ! [[ "${total}" =~ ^[0-9]+$ ]] || ((total < 1)); then
+    if ! [[ "${total}" =~ ^[0-9]+$ ]] || ((10#${total} < 1)); then
         _fail "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.list_index.empty_list")"
         return 1
     fi
@@ -925,7 +1049,7 @@ function check_list_index() {
         return 1
     fi
 
-    if ((index < 1 || index > total)); then
+    if ((10#${index} < 1 || 10#${index} > 10#${total})); then
         _fail "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.list_index.range_error" | sed "s|\${total}|${total}|g")${index}"
         return 1
     fi
@@ -969,6 +1093,7 @@ function main() {
     --proxy-target) check_proxy_target "$@" ;;
     --custom-domain) check_custom_site_domain "$@" >&2 ;;
     --list-index) check_list_index "$@" >&2 ;;
+    *) return 1 ;;
     esac
 }
 

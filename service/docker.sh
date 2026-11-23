@@ -15,7 +15,7 @@
 # Cloudreve:
 #   https://cloudreve.org
 # =============================================================================
-# 注释: 通过 Qwen3-Coder 生成。
+# 注释: 通过 Gemini-Neon 生成。
 # 脚本名称: docker.sh
 # 功能描述: 提供 Docker 环境管理功能，包括安装 Docker、管理 Cloudflare WARP 容器、
 #           以及管理 Cloudreve (v3 和 v4) 容器服务。
@@ -80,11 +80,19 @@ declare I18N_DATA=''  # 存储从 i18n JSON 文件中读取的全部数据
 # =============================================================================
 function load_i18n() {
     # 从配置文件中读取语言设置
-    local lang="$(jq -r '.language' "${SCRIPT_CONFIG_PATH}")"
+    local lang=""
+    if [[ -f "${SCRIPT_CONFIG_PATH}" ]]; then
+        lang="$(jq -r '.language // "auto"' "${SCRIPT_CONFIG_PATH}" 2>/dev/null)"
+    fi
+    [[ -z "${lang}" || "${lang}" == "null" ]] && lang="auto"
 
     # 如果语言设置为 "auto"，则使用系统环境变量 LANG 的第一部分作为语言代码
     if [[ "$lang" == "auto" ]]; then
-        lang=$(echo "$LANG" | cut -d'_' -f1)
+        lang="${LANG%%_*}"
+        lang="${lang%%.*}"
+        case "${lang}" in
+        "" | C | POSIX) lang="en" ;;
+        esac
     fi
 
     # 构造 i18n 文件的完整路径
@@ -115,7 +123,9 @@ function load_i18n() {
 # =============================================================================
 function print_info() {
     # 从 i18n 数据中读取 "信息" 标题，然后用绿色打印消息
-    printf "${GREEN}[$(echo "$I18N_DATA" | jq -r '.title.info')] ${NC}%s\n" "$*" >&2
+    local title="Info"
+    [[ -n "${I18N_DATA}" ]] && title="$(echo "$I18N_DATA" | jq -r '.title.info // "Info"')"
+    printf '%b[%s]%b %s\n' "${GREEN}" "${title}" "${NC}" "$*" >&2
 }
 
 # =============================================================================
@@ -127,7 +137,9 @@ function print_info() {
 # =============================================================================
 function print_warn() {
     # 从 i18n 数据中读取 "警告" 标题，然后用黄色打印消息
-    printf "${YELLOW}[$(echo "$I18N_DATA" | jq -r '.title.warn')] ${NC}%s\n" "$*" >&2
+    local title="Warn"
+    [[ -n "${I18N_DATA}" ]] && title="$(echo "$I18N_DATA" | jq -r '.title.warn // "Warn"')"
+    printf '%b[%s]%b %s\n' "${YELLOW}" "${title}" "${NC}" "$*" >&2
 }
 
 # =============================================================================
@@ -137,9 +149,23 @@ function print_warn() {
 #   $@: 消息内容 (msg)
 # 返回值: 无 (直接打印到标准错误输出 >&2，然后 exit 1)
 # =============================================================================
+function replace_placeholder() {
+    local text="$1"
+    local placeholder="$2"
+    local replacement="$3"
+    local out=""
+    while [[ "${text}" == *"${placeholder}"* ]]; do
+        out+="${text%%"${placeholder}"*}${replacement}"
+        text="${text#*"${placeholder}"}"
+    done
+    printf '%s' "${out}${text}"
+}
+
 function print_error() {
     # 从 i18n 数据中读取 "错误" 标题，然后用红色打印消息
-    printf "${RED}[$(echo "$I18N_DATA" | jq -r '.title.error')] ${NC}%s\n" "$*" >&2
+    local title="Error"
+    [[ -n "${I18N_DATA}" ]] && title="$(echo "$I18N_DATA" | jq -r '.title.error // "Error"')"
+    printf '%b[%s]%b %s\n' "${RED}" "${title}" "${NC}" "$*" >&2
     # 打印错误信息后退出脚本，错误码为 1
     exit 1
 }
@@ -218,26 +244,37 @@ function install_docker() {
     # 打印开始安装的信息
     print_info "$(echo "$I18N_DATA" | jq -r '.docker.install.start')"
 
-    # 下载 Docker 官方安装脚本到工具目录
-    wget -O "${TOOL_DIR}/install-docker.sh" https://get.docker.com
+    mkdir -p "${TOOL_DIR}"
+    local installer_path="${TOOL_DIR}/install-docker.sh"
+
+    # 下载 Docker 官方安装脚本到工具目录（带超时与校验）
+    if ! curl -fsSL --connect-timeout 15 --max-time 60 -o "${installer_path}" https://get.docker.com; then
+        rm -f "${installer_path}"
+        print_error "Failed to download Docker install script"
+    fi
 
     # 检查是否为 CentOS 8 系统
-    if [[ "$(_os)" == "centos" && "$(_os_ver)" -eq 8 ]]; then
+    if [[ "$(_os)" == "centos" && "$(_os_ver)" == "8" ]]; then
         # 打印针对 CentOS 8 的修复信息
         print_info "$(echo "$I18N_DATA" | jq -r '.docker.install.centos8_fix')"
         # 修改安装脚本，在安装命令中添加 --allowerasing 选项以解决依赖冲突
-        sed -i 's|$sh_c "$pkg_manager install -y -q $pkgs"| $sh_c "$pkg_manager install -y -q $pkgs --allowerasing"|' "${TOOL_DIR}/install-docker.sh"
+        sed -i 's|$sh_c "$pkg_manager install -y -q $pkgs"| $sh_c "$pkg_manager install -y -q $pkgs --allowerasing"|' "${installer_path}"
     fi
 
     # 打印运行前检查的信息
     print_info "$(echo "$I18N_DATA" | jq -r '.docker.install.dry_run')"
     # 执行安装脚本的 --dry-run 模式进行检查
-    sh "${TOOL_DIR}/install-docker.sh" --dry-run
+    sh "${installer_path}" --dry-run || print_error "Docker dry-run check failed"
 
     # 打印正式运行安装的信息
     print_info "$(echo "$I18N_DATA" | jq -r '.docker.install.running')"
     # 执行安装脚本进行实际安装
-    sh "${TOOL_DIR}/install-docker.sh"
+    sh "${installer_path}" || print_error "Docker installation failed"
+
+    # 确保 Docker 服务已启动并设为开机自启
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl enable --now docker >/dev/null 2>&1 || true
+    fi
 }
 
 # =============================================================================
@@ -248,8 +285,24 @@ function install_docker() {
 # 返回值: 容器的 IP 地址 (echo 输出)
 # =============================================================================
 function get_container_ip() {
-    # 使用 docker inspect 命令获取容器的 IP 地址
-    docker inspect --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$1"
+    # 使用 docker inspect 获取容器首个非空网络 IP（避免多网络拼接粘连）
+    docker inspect --format='{{range .NetworkSettings.Networks}}{{if .IPAddress}}{{.IPAddress}}{{"\n"}}{{end}}{{end}}' "$1" 2>/dev/null | head -n 1 | tr -d '[:space:]'
+}
+
+function wait_container_ip() {
+    local container_name="$1"
+    local ip=""
+    local attempt=0
+    while ((attempt < 10)); do
+        ip="$(get_container_ip "${container_name}")"
+        if [[ -n "${ip}" ]]; then
+            printf '%s\n' "${ip}"
+            return 0
+        fi
+        sleep 0.5
+        ((++attempt))
+    done
+    return 1
 }
 
 # =============================================================================
@@ -261,7 +314,7 @@ function get_container_ip() {
 # =============================================================================
 function build_warp() {
     # 检查名为 xray-script-warp 的镜像是否已存在
-    if ! docker images --format "{{.Repository}}" | grep -q xray-script-warp; then
+    if ! docker images --format "{{.Repository}}" | grep -Fxq "xray-script-warp"; then
         # 打印开始构建的信息
         print_info "$(echo "$I18N_DATA" | jq -r '.docker.warp.build.start')"
         # 使用 docker build 命令构建镜像，失败则调用 print_error 退出
@@ -295,7 +348,7 @@ function enable_warp() {
             if ! docker ps --format "{{.Names}}" | grep -q "^${container_name}\$"; then
                 docker start "${container_name}" >&2 || print_error "Failed to start WARP container"
             fi
-            container_ip="$(get_container_ip "${container_name}")"
+            container_ip="$(wait_container_ip "${container_name}")" || print_error "Failed to obtain WARP container IP"
             print_info "Cloudflare WARP container is ready: ${container_ip}"
             echo "${container_ip}"
             return 0
@@ -321,9 +374,10 @@ function enable_warp() {
         -v "${WARP_DIR}":/var/lib/cloudflare-warp:rw \
         xray-script-warp >&2 || print_error "$(echo "$I18N_DATA" | jq -r '.docker.warp.build.fail')"
 
-    # 获取新启动容器的 IP 地址。
-    container_ip="$(get_container_ip "${container_name}")"
-    print_info "$(echo "$I18N_DATA" | jq -r ".docker.warp.enable.success" | sed "s/\${container_ip}/${container_ip}/")"
+    # 等待并获取新启动容器的 IP 地址。
+    container_ip="$(wait_container_ip "${container_name}")" || print_error "Failed to obtain WARP container IP"
+    local msg_tpl="$(echo "$I18N_DATA" | jq -r '.docker.warp.enable.success')"
+    print_info "$(replace_placeholder "${msg_tpl}" '${container_ip}' "${container_ip}")"
     echo "${container_ip}"
 }
 
@@ -334,19 +388,22 @@ function enable_warp() {
 # 返回值: 无 (执行停止和清理过程)
 # =============================================================================
 function disable_warp() {
-    # 检查名为 xray-script-warp 的容器是否在运行
-    if docker ps --format "{{.Names}}" | grep -q "^xray-script-warp\$"; then
-        # 打印停止容器的警告信息
+    local cleaned=0
+    # 兼容运行中与已停止/退出的容器
+    if docker ps -a --format "{{.Names}}" | grep -Fxq "xray-script-warp"; then
         print_warn "$(echo "$I18N_DATA" | jq -r '.docker.warp.disable.stop')"
-        # 停止容器
-        docker stop xray-script-warp
-        # 删除容器
-        docker rm xray-script-warp
-        # 删除镜像
-        docker image rm xray-script-warp
-        # 删除 WARP 数据目录
+        docker rm -f xray-script-warp >&2 || true
+        cleaned=1
+    fi
+    if docker images --format "{{.Repository}}" | grep -Fxq "xray-script-warp"; then
+        docker image rm -f xray-script-warp >&2 || true
+        cleaned=1
+    fi
+    if [[ -d "${WARP_DIR}" ]]; then
         rm -rf "${WARP_DIR}"
-        # 打印禁用成功的消息
+        cleaned=1
+    fi
+    if [[ ${cleaned} -eq 1 ]]; then
         print_info "$(echo "$I18N_DATA" | jq -r '.docker.warp.disable.success')"
     fi
 }
@@ -380,15 +437,15 @@ function install_cloudreve_v3() {
         # 修改 docker-compose.yaml 中的容器名称
         sed -i "s|container_name: cloudreve|container_name: cloudreve_v3|" "${CLOUDREVE_V3_DIR}/docker-compose.yaml"
         # 修改 docker-compose.yaml 中的挂载路径
-        sed -i "s|/usr/local/cloudreve|${CLOUDREVE_V3_DIR}|" "${CLOUDREVE_V3_DIR}/docker-compose.yaml"
+        sed -i "s|/usr/local/cloudreve|${CLOUDREVE_V3_DIR}|g" "${CLOUDREVE_V3_DIR}/docker-compose.yaml"
         # 生成并替换 Aria2 的 RPC 密钥
-        sed -i "s|your_aria_rpc_token|$(openssl rand -hex 32)|" "${CLOUDREVE_V3_DIR}/docker-compose.yaml"
+        sed -i "s|your_aria_rpc_token|$(openssl rand -hex 32)|g" "${CLOUDREVE_V3_DIR}/docker-compose.yaml"
 
         # 打印启动服务的信息
         print_info "$(echo "$I18N_DATA" | jq -r '.docker.cloudreve_v3.start')"
         # 切换到 Cloudreve v3 目录并启动服务
-        cd "${CLOUDREVE_V3_DIR}"
-        docker compose up -d
+        cd "${CLOUDREVE_V3_DIR}" || print_error "Failed to enter ${CLOUDREVE_V3_DIR}"
+        docker compose up -d || print_error "Failed to start Cloudreve v3"
         # 等待服务启动
         sleep 5
         # 获取并显示管理员账户信息
@@ -406,15 +463,16 @@ function install_cloudreve_v3() {
 # =============================================================================
 function get_cloudreve_v3_admin() {
     # 检查名为 cloudreve_v3 的容器是否在运行
-    if docker ps --format "{{.Names}}" | grep -q "^cloudreve_v3\$"; then
-        # 获取容器启动日志的前 20 行
-        local cloudreve_info="$(docker logs cloudreve_v3 | head -n 20)"
-        # 从日志中提取用户名 (通常是第一行包含 Admin 的最后一列)
-        local cloudreve_username="$(echo "${cloudreve_info}" | grep Admin | awk '{print $NF}' | head -1)"
-        # 从日志中提取密码 (通常是第二行包含 Admin 的最后一列)
-        local cloudreve_password="$(echo "${cloudreve_info}" | grep Admin | awk '{print $NF}' | tail -1)"
-        # 打印管理员账户信息
-        print_info "$(echo "$I18N_DATA" | jq -r ".docker.cloudreve_v3.admin_info" | sed "s/\${username}/${cloudreve_username}/;s/\${password}/${cloudreve_password}/")"
+    if docker ps --format "{{.Names}}" | grep -Fxq "cloudreve_v3"; then
+        # 同时捕获 stdout 与 stderr 的前 30 行启动日志
+        local cloudreve_info="$(docker logs cloudreve_v3 2>&1 | head -n 30)"
+        local cloudreve_username="$(printf '%s\n' "${cloudreve_info}" | grep Admin | awk '{print $NF}' | head -n 1)"
+        local cloudreve_password="$(printf '%s\n' "${cloudreve_info}" | grep Admin | awk '{print $NF}' | tail -n 1)"
+        # 使用纯 Bash 字符串替换，避免随机密码包含 / 或 & 导致 sed 报错
+        local msg_tpl="$(echo "$I18N_DATA" | jq -r '.docker.cloudreve_v3.admin_info')"
+        msg_tpl="$(replace_placeholder "${msg_tpl}" '${username}' "${cloudreve_username}")"
+        msg_tpl="$(replace_placeholder "${msg_tpl}" '${password}' "${cloudreve_password}")"
+        print_info "${msg_tpl}"
     fi
 }
 
@@ -425,10 +483,11 @@ function get_cloudreve_v3_admin() {
 # 返回值: 无 (打印 Aria2 Token 到 >&2)
 # =============================================================================
 function get_aria2_token() {
-    # 从 docker-compose.yaml 文件中提取 RPC_SECRET 的值
-    local token="$(sed -n 's/.*RPC_SECRET=//p' "${CLOUDREVE_V3_DIR}/docker-compose.yaml")"
-    # 打印 Aria2 Token 信息
-    print_info "$(echo "$I18N_DATA" | jq -r ".docker.cloudreve_v3.aria2_token" | sed "s/\${token}/${token}/")"
+    [[ -f "${CLOUDREVE_V3_DIR}/docker-compose.yaml" ]] || return 0
+    # 从 docker-compose.yaml 文件中提取 RPC_SECRET 的值并去除首尾引号与空白
+    local token="$(sed -n 's/.*RPC_SECRET=//p' "${CLOUDREVE_V3_DIR}/docker-compose.yaml" | head -n 1 | tr -d '"' | tr -d "'" | tr -d '[:space:]')"
+    local msg_tpl="$(echo "$I18N_DATA" | jq -r '.docker.cloudreve_v3.aria2_token')"
+    print_info "$(replace_placeholder "${msg_tpl}" '${token}' "${token}")"
 }
 
 # =============================================================================
@@ -439,23 +498,14 @@ function get_aria2_token() {
 # 返回值: 无 (执行重置过程)
 # =============================================================================
 function reset_cloudreve_v3_admin() {
-    # 检查名为 cloudreve_v3 的容器是否在运行
-    if docker ps --format "{{.Names}}" | grep -q "^cloudreve_v3\$"; then
-        # 打印重置账户的信息
+    if [[ -d "${CLOUDREVE_V3_DIR}" ]] && docker ps -a --format "{{.Names}}" | grep -Fxq "cloudreve_v3"; then
         print_info "$(echo "$I18N_DATA" | jq -r '.docker.cloudreve_v3.reset')"
-        # 切换到 Cloudreve v3 目录
-        cd "${CLOUDREVE_V3_DIR}"
-        # 停止服务
+        cd "${CLOUDREVE_V3_DIR}" || print_error "Failed to enter ${CLOUDREVE_V3_DIR}"
         docker compose down
-        # 删除数据库文件
-        rm -rf "${CLOUDREVE_V3_DIR}/cloudreve.db"
-        # 重新创建空的数据库文件
+        rm -f "${CLOUDREVE_V3_DIR}/cloudreve.db"
         touch "${CLOUDREVE_V3_DIR}/cloudreve.db"
-        # 重启服务
-        docker compose up -d
-        # 等待服务启动
+        docker compose up -d || print_error "Failed to restart Cloudreve v3"
         sleep 5
-        # 获取并显示新的管理员账户信息
         get_cloudreve_v3_admin
     fi
 }
@@ -467,17 +517,14 @@ function reset_cloudreve_v3_admin() {
 # 返回值: 无 (执行卸载过程)
 # =============================================================================
 function purge_cloudreve_v3() {
-    # 检查名为 cloudreve_v3 的容器是否在运行
-    if docker ps --format "{{.Names}}" | grep -q "^cloudreve_v3\$"; then
-        # 打印彻底卸载的警告信息
+    if [[ -d "${CLOUDREVE_V3_DIR}" ]] || docker ps -a --format "{{.Names}}" | grep -Fxq "cloudreve_v3"; then
         print_warn "$(echo "$I18N_DATA" | jq -r '.docker.cloudreve_v3.purge')"
-        # 切换到 Cloudreve v3 目录
-        cd "${CLOUDREVE_V3_DIR}"
-        # 停止服务
-        docker compose down
-        # 切换到用户主目录
-        cd "${HOME}"
-        # 删除整个 Cloudreve v3 目录
+        if [[ -f "${CLOUDREVE_V3_DIR}/docker-compose.yaml" ]]; then
+            (cd "${CLOUDREVE_V3_DIR}" && docker compose down) || true
+        else
+            docker rm -f cloudreve_v3 >/dev/null 2>&1 || true
+        fi
+        cd "${HOME}" || true
         rm -rf "${CLOUDREVE_V3_DIR}"
     fi
 }
@@ -550,8 +597,8 @@ function install_cloudreve_v4() {
         # 打印启动服务的信息
         print_info "$(echo "$I18N_DATA" | jq -r '.docker.cloudreve_v4.start')"
         # 切换到 Cloudreve v4 目录并启动服务
-        cd "${CLOUDREVE_V4_DIR}"
-        docker compose up -d
+        cd "${CLOUDREVE_V4_DIR}" || print_error "Failed to enter ${CLOUDREVE_V4_DIR}"
+        docker compose up -d || print_error "Failed to start Cloudreve v4"
     fi
 }
 
@@ -563,18 +610,11 @@ function install_cloudreve_v4() {
 # 返回值: 无 (执行更新过程)
 # =============================================================================
 function update_cloudreve_v4() {
-    # 检查名为 cloudreve_v4 的容器是否在运行
-    if docker ps --format "{{.Names}}" | grep -q "^cloudreve_v4\$"; then
-        # 打印更新服务的信息
+    if [[ -f "${CLOUDREVE_V4_DIR}/docker-compose.yaml" ]]; then
         print_info "$(echo "$I18N_DATA" | jq -r '.docker.cloudreve_v4.update')"
-        # 切换到 Cloudreve v4 目录
-        cd "${CLOUDREVE_V4_DIR}"
-        # 停止服务
-        docker compose down
-        # 拉取最新的镜像
-        docker compose pull
-        # 重启服务
-        docker compose up -d
+        cd "${CLOUDREVE_V4_DIR}" || print_error "Failed to enter ${CLOUDREVE_V4_DIR}"
+        docker compose pull || print_error "Failed to pull Cloudreve v4 image"
+        docker compose up -d || print_error "Failed to restart Cloudreve v4"
     fi
 }
 
@@ -585,17 +625,14 @@ function update_cloudreve_v4() {
 # 返回值: 无 (执行卸载过程)
 # =============================================================================
 function purge_cloudreve_v4() {
-    # 检查名为 cloudreve_v4 的容器是否在运行
-    if docker ps --format "{{.Names}}" | grep -q "^cloudreve_v4\$"; then
-        # 打印彻底卸载的警告信息
+    if [[ -d "${CLOUDREVE_V4_DIR}" ]] || docker ps -a --format "{{.Names}}" | grep -Fxq "cloudreve_v4"; then
         print_warn "$(echo "$I18N_DATA" | jq -r '.docker.cloudreve_v4.purge')"
-        # 切换到 Cloudreve v4 目录
-        cd "${CLOUDREVE_V4_DIR}"
-        # 停止服务
-        docker compose down
-        # 切换到用户主目录
-        cd "${HOME}"
-        # 删除整个 Cloudreve v4 目录
+        if [[ -f "${CLOUDREVE_V4_DIR}/docker-compose.yaml" ]]; then
+            (cd "${CLOUDREVE_V4_DIR}" && docker compose down) || true
+        else
+            docker rm -f cloudreve_v4 >/dev/null 2>&1 || true
+        fi
+        cd "${HOME}" || true
         rm -rf "${CLOUDREVE_V4_DIR}"
     fi
 }
@@ -654,8 +691,11 @@ function stop_cloudreve_v4() {
 function clean_container_logs() {
     # 获取容器名称或 ID
     local container_name_or_id="${1:-xray-script-warp}"
-    # 找到容器的日志文件并清空
-    truncate -s 0 $(docker inspect --format='{{.LogPath}}' "${container_name_or_id}")
+    local log_path=""
+    log_path="$(docker inspect --format='{{.LogPath}}' "${container_name_or_id}" 2>/dev/null || true)"
+    if [[ -n "${log_path}" && -f "${log_path}" ]]; then
+        truncate -s 0 "${log_path}"
+    fi
 }
 
 # =============================================================================
@@ -707,8 +747,9 @@ function main() {
     --purge-cloudreve-v4) purge_cloudreve_v4 ;;             # 彻底卸载 Cloudreve v4
     --start-cloudreve-v4) start_cloudreve_v4 ;;             # 启动 Cloudreve v4
     --stop-cloudreve-v4) stop_cloudreve_v4 ;;               # 停止 Cloudreve v4
-    --clean-container-logs) clean_container_logs $2 ;;      # 清空容器日志文件
-    --obtain-container-ip) obtain_container_ip $2 ;;        # 获取容器 IP 地址
+    --clean-container-logs) clean_container_logs "$2" ;;    # 清空容器日志文件
+    --obtain-container-ip) obtain_container_ip "$2" ;;      # 获取容器 IP 地址
+    *) print_error "Unsupported docker option: $1" ;;
     esac
 }
 

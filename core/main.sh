@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# 注释: 通过 Qwen3-Coder 生成。
+# 注释: 通过 Gemini-Neon 生成。
 # 脚本名称: main.sh
 # 脚本仓库: https://github.com/zxcvos/Xray-script
 # 功能描述: Xray-script 项目的主要管理脚本。
@@ -74,10 +74,18 @@ declare SCRIPT_CONFIG='' # 存储脚本配置内容
 
 function load_i18n() {
     # 从配置文件中读取语言设置
-    local lang="$(jq -r '.language' "${SCRIPT_CONFIG_PATH}")"
+    local lang=""
+    if [[ -f "${SCRIPT_CONFIG_PATH}" ]]; then
+        lang="$(jq -r '.language // "auto"' "${SCRIPT_CONFIG_PATH}" 2>/dev/null)"
+    fi
+    [[ -z "${lang}" || "${lang}" == "null" ]] && lang="auto"
     # 如果语言设置为 "auto"，则使用系统环境变量 LANG 的第一部分作为语言代码
     if [[ "$lang" == "auto" ]]; then
-        lang=$(echo "$LANG" | cut -d'_' -f1)
+        lang="${LANG%%_*}"
+        lang="${lang%%.*}"
+        case "${lang}" in
+        "" | C | POSIX) lang="en" ;;
+        esac
     fi
     # 记录当前语言代码
     CURRENT_LANG="${lang}"
@@ -108,11 +116,9 @@ function load_i18n() {
 
 function _warn() {
     # 打印红色的错误标题（从 i18n 数据获取）
-    printf "${RED}[$(echo "$I18N_DATA" | jq -r '.title.error')] ${NC}" >&2
-    # 打印传入的错误信息
-    printf -- "%s" "$@" >&2
-    # 打印换行符
-    printf "\n" >&2
+    local title="Error"
+    [[ -n "${I18N_DATA}" ]] && title="$(echo "$I18N_DATA" | jq -r '.title.error // "Error"')"
+    printf '%b[%s]%b %s\n' "${RED}" "${title}" "${NC}" "$*" >&2
 }
 
 # =============================================================================
@@ -140,9 +146,9 @@ function _error() {
 function pause_continue() {
     echo >&2
     if [[ "${CURRENT_LANG}" == "zh" ]]; then
-        printf "${YELLOW}[提示]${NC} 按回车键继续..." >&2
+        printf '%b[提示]%b 按回车键继续...' "${YELLOW}" "${NC}" >&2
     else
-        printf "${YELLOW}[Tip]${NC} Press Enter to continue..." >&2
+        printf '%b[Tip]%b Press Enter to continue...' "${YELLOW}" "${NC}" >&2
     fi
     read -r _ || true
     echo >&2
@@ -255,24 +261,24 @@ function processes_web_config() {
         if [[ "${is_change}" == 'y' ]]; then
             exec_handler '--web' "${web}"
             rc=$?
-            pause_continue
+            [[ ${rc} -ne ${RC_BACK} ]] && pause_continue
             return ${rc}
         else
             # 如果 is_change 为 'n'，则执行完整安装流程
-            current_tag="$(jq -r '.xray.tag' "${SCRIPT_CONFIG_PATH}")"
+            current_tag="$(jq -r '.xray.tag // empty' "${SCRIPT_CONFIG_PATH}" 2>/dev/null)"
             if [[ "${current_tag,,}" != 'sni' ]]; then
                 exec_handler '--sni-ports' || {
                     rc=$?
-                    pause_continue
+                    [[ ${rc} -ne ${RC_BACK} ]] && pause_continue
                     return ${rc}
                 }
             fi
-            exec_handler '--script-config' 'SNI' || { rc=$?; pause_continue; return ${rc}; }  # 设置脚本配置为 SNI
-            exec_handler '--install' || { rc=$?; pause_continue; return ${rc}; }              # 安装核心组件
-            exec_handler '--nginx-install' || { rc=$?; pause_continue; return ${rc}; }        # 安装 Nginx
-            exec_handler '--xray-config' "${web}" || { rc=$?; pause_continue; return ${rc}; } # 配置 Xray 使用选定的 web 类型
-            exec_handler '--restart' || { rc=$?; pause_continue; return ${rc}; }              # 重启 Xray 服务
-            exec_handler '--share' || { rc=$?; pause_continue; return ${rc}; }                # 显示分享链接
+            exec_handler '--script-config' 'SNI' || { rc=$?; [[ ${rc} -ne ${RC_BACK} ]] && pause_continue; return ${rc}; }  # 设置脚本配置为 SNI
+            exec_handler '--install' || { rc=$?; [[ ${rc} -ne ${RC_BACK} ]] && pause_continue; return ${rc}; }              # 安装核心组件
+            exec_handler '--nginx-install' || { rc=$?; [[ ${rc} -ne ${RC_BACK} ]] && pause_continue; return ${rc}; }        # 安装 Nginx
+            exec_handler '--xray-config' "${web}" || { rc=$?; [[ ${rc} -ne ${RC_BACK} ]] && pause_continue; return ${rc}; } # 配置 Xray 使用选定的 web 类型
+            exec_handler '--restart' || { rc=$?; [[ ${rc} -ne ${RC_BACK} ]] && pause_continue; return ${rc}; }              # 重启 Xray 服务
+            exec_handler '--share' || { rc=$?; [[ ${rc} -ne ${RC_BACK} ]] && pause_continue; return ${rc}; }                # 显示分享链接
             pause_continue
             return ${RC_DONE}
         fi
@@ -305,12 +311,14 @@ function processes_ca_vendor() {
 
         if [[ "${apply_mode}" != 'preview' ]]; then
             if [[ "${apply_mode}" == 'switch' && "${ca_server}" != "${current_ca_server}" ]]; then
-                switch_confirm="$(exec_read '--switch-ca')"
+                local read_rc=0
+                switch_confirm="$(exec_read '--switch-ca')" || read_rc=$?
+                [[ ${read_rc} -eq 130 ]] && echo >&2
                 [[ "${switch_confirm,,}" == 'y' ]] || return ${RC_BACK}
             fi
             exec_handler '--ca-server' "${ca_server}"
             rc=$?
-            [[ "${apply_mode}" == 'switch' ]] && pause_continue
+            [[ "${apply_mode}" == 'switch' && ${rc} -ne ${RC_BACK} ]] && pause_continue
             return ${rc}
         fi
         return ${RC_DONE}
@@ -373,11 +381,12 @@ function processes_xray_config() {
             continue
         else
             # 对于其他配置类型
-            exec_handler '--script-config' "${XTLS_CONFIG}" || { pause_continue; continue; } # 设置脚本配置
-            exec_handler '--install' || { pause_continue; continue; }                        # 安装核心组件
-            exec_handler '--xray-config' || { pause_continue; continue; }                    # 配置 Xray
-            exec_handler '--restart' || { pause_continue; continue; }                        # 重启 Xray 服务
-            exec_handler '--share' || { pause_continue; continue; }                          # 显示分享链接
+            local step_rc=0
+            exec_handler '--script-config' "${XTLS_CONFIG}" || { step_rc=$?; [[ ${step_rc} -ne ${RC_BACK} ]] && pause_continue; continue; } # 设置脚本配置
+            exec_handler '--install' || { step_rc=$?; [[ ${step_rc} -ne ${RC_BACK} ]] && pause_continue; continue; }                        # 安装核心组件
+            exec_handler '--xray-config' || { step_rc=$?; [[ ${step_rc} -ne ${RC_BACK} ]] && pause_continue; continue; }                    # 配置 Xray
+            exec_handler '--restart' || { step_rc=$?; [[ ${step_rc} -ne ${RC_BACK} ]] && pause_continue; continue; }                        # 重启 Xray 服务
+            exec_handler '--share' || { step_rc=$?; [[ ${step_rc} -ne ${RC_BACK} ]] && pause_continue; continue; }                          # 显示分享链接
             pause_continue
             return ${RC_DONE}
         fi
@@ -515,7 +524,7 @@ function processes_routing() {
         if [[ ${rc} -eq ${RC_DONE} ]]; then
             exec_handler '--restart' # 重启 Xray 服务
         fi
-        pause_continue
+        [[ ${rc} -ne ${RC_BACK} ]] && pause_continue
     done
 }
 
@@ -552,7 +561,7 @@ function processes_custom_sites() {
 
 function processes_sni_config() {
     # 从配置文件中读取当前 Xray 的 tag
-    local tag="$(jq -r '.xray.tag' "${SCRIPT_CONFIG_PATH}")"
+    local tag="$(jq -r '.xray.tag // empty' "${SCRIPT_CONFIG_PATH}" 2>/dev/null)"
     # 检查 tag 是否为 'sni' (不区分大小写)，如果不是则提示错误并返回上一级
     if [[ "${tag,,}" != 'sni' ]]; then
         _warn "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.not_support")"
@@ -613,10 +622,16 @@ function processes_language() {
             continue
             ;;
         esac
-        # 更新配置文件中的语言设置并重新加载 i18n
-        SCRIPT_CONFIG="$(jq --arg language "${LANG_PARAM}" '.language = $language' "${SCRIPT_CONFIG_PATH}")"
-        echo "${SCRIPT_CONFIG}" >"${SCRIPT_CONFIG_PATH}"
-        load_i18n
+        # 更新配置文件中的语言设置并原子写回，避免 jq 异常清空原配置
+        if SCRIPT_CONFIG="$(jq --arg language "${LANG_PARAM}" '.language = $language' "${SCRIPT_CONFIG_PATH}")" && [[ -n "${SCRIPT_CONFIG}" ]]; then
+            local tmp_file="${SCRIPT_CONFIG_PATH}.tmp.$$"
+            printf '%s\n' "${SCRIPT_CONFIG}" >"${tmp_file}" && mv -f "${tmp_file}" "${SCRIPT_CONFIG_PATH}"
+            load_i18n
+        else
+            _warn "failed to save language setting"
+            pause_continue
+            return ${RC_ERR}
+        fi
         return ${RC_DONE}
     done
 }

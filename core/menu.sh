@@ -5,7 +5,7 @@
 # Xray-script:
 #   https://github.com/zxcvos/Xray-script
 # =============================================================================
-# 注释: 通过 Qwen3-Coder 生成。
+# 注释: 通过 Gemini-Neon 生成。
 # 脚本名称: menu.sh
 # 功能描述: 提供交互式菜单界面，用于 Xray-script 项目的主控制台。
 #           显示各种配置选项、状态信息和操作菜单，支持多语言。
@@ -67,11 +67,19 @@ declare I18N_DATA=''     # 存储从 i18n JSON 文件中读取的全部数据
 # =============================================================================
 function load_i18n() {
     # 从脚本配置文件中读取语言设置
-    local lang="$(jq -r '.language' "${SCRIPT_CONFIG_PATH}")"
+    local lang=""
+    if [[ -f "${SCRIPT_CONFIG_PATH}" ]]; then
+        lang="$(jq -r '.language // "auto"' "${SCRIPT_CONFIG_PATH}" 2>/dev/null)"
+    fi
+    [[ -z "${lang}" || "${lang}" == "null" ]] && lang="auto"
 
     # 如果语言设置为 "auto"，则使用系统环境变量 LANG 的第一部分作为语言代码
     if [[ "$lang" == "auto" ]]; then
-        lang=$(echo "$LANG" | cut -d'_' -f1)
+        lang="${LANG%%_*}"
+        lang="${lang%%.*}"
+        case "${lang}" in
+        "" | C | POSIX) lang="en" ;;
+        esac
     fi
 
     # 记录当前语言代码
@@ -139,7 +147,7 @@ function menu_language() {
 # =============================================================================
 function menu_index() {
     # 从配置文件中读取脚本版本号
-    local version=$(jq -r '.version' "${SCRIPT_CONFIG_PATH}")
+    local version="$(jq -r '.version // empty' "${SCRIPT_CONFIG_PATH}" 2>/dev/null)"
 
     # 打印主菜单标题和版本信息
     echo -e "--------------- Xray-script ------------------"
@@ -459,7 +467,10 @@ function menu_custom_sites() {
 # =============================================================================
 function print_banner() {
     # 生成一个 0 或 1 的随机数
-    case $(($(bash "${GENERATE_PATH}" '--random' 1 100) % 2)) in
+    local rand_num=""
+    rand_num="$(bash "${GENERATE_PATH}" '--random' 2>/dev/null | tr -d '[:space:]')"
+    [[ "${rand_num}" =~ ^[0-9]+$ ]] || rand_num="${RANDOM}"
+    case $((10#${rand_num} % 2)) in
     # 如果是 0，打印第一个 Banner (解码后)
     0)
         echo "IBtbMDsxOzM1Ozk1bV8bWzA7MTszMTs5MW1fG1swbSAgIBtbMDsxOzMyOzkybV9fG1swbSAgG1swOzE7MzQ7OTRtXxtbMG0gICAgG1swOzE7MzE7OTFtXxtbMG0gICAbWzA7MTszMjs5Mm1fG1swOzE7MzY7OTZtX18bWzA7MTszNDs5NG1fXxtbMDsxOzM1Ozk1bV9fG1swbSAgIBtbMDsxOzMzOzkzbV8bWzA7MTszMjs5Mm1fXxtbMDsxOzM2Ozk2bV9fG1swOzE7MzQ7OTRtX18bWzBtICAgG1swOzE7MzE7OTFtXxtbMDsxOzMzOzkzbV9fG1swOzE7MzI7OTJtX18bWzBtICAKIBtbMDsxOzMxOzkxbVwbWzBtIBtbMDsxOzMzOzkzbVwbWzBtIBtbMDsxOzMyOzkybS8bWzBtIBtbMDsxOzM2Ozk2bS8bWzBtIBtbMDsxOzM0Ozk0bXwbWzBtIBtbMDsxOzM1Ozk1bXwbWzBtICAbWzA7MTszMzs5M218G1swbSAbWzA7MTszMjs5Mm18G1swbSAbWzA7MTszNjs5Nm18XxtbMDsxOzM0Ozk0bV8bWzBtICAgG1swOzE7MzE7OTFtX18bWzA7MTszMzs5M218G1swbSAbWzA7MTszMjs5Mm18XxtbMDsxOzM2Ozk2bV8bWzBtICAgG1swOzE7MzU7OTVtX18bWzA7MTszMTs5MW18G1swbSAbWzA7MTszMzs5M218G1swbSAgG1swOzE7MzI7OTJtXxtbMDsxOzM2Ozk2bV8bWzBtIBtbMDsxOzM0Ozk0bVwbWzBtIAogIBtbMDsxOzMyOzkybVwbWzBtIBtbMDsxOzM2Ozk2bVYbWzBtIBtbMDsxOzM0Ozk0bS8bWzBtICAbWzA7MTszNTs5NW18G1swbSAbWzA7MTszMTs5MW18G1swOzE7MzM7OTNtX18bWzA7MTszMjs5Mm18G1swbSAbWzA7MTszNjs5Nm18G1swbSAgICAbWzA7MTszNTs5NW18G1swbSAbWzA7MTszMTs5MW18G1swbSAgICAgICAbWzA7MTszNDs5NG18G1swbSAbWzA7MTszNTs5NW18G1swbSAgICAbWzA7MTszMjs5Mm18G1swbSAbWzA7MTszNjs5Nm18XxtbMDsxOzM0Ozk0bV8pG1swbSAbWzA7MTszNTs5NW18G1swbQogICAbWzA7MTszNjs5Nm0+G1swbSAbWzA7MTszNDs5NG08G1swbSAgIBtbMDsxOzMxOzkxbXwbWzBtICAbWzA7MTszMjs5Mm1fXxtbMG0gIBtbMDsxOzM0Ozk0bXwbWzBtICAgIBtbMDsxOzMxOzkxbXwbWzBtIBtbMDsxOzMzOzkzbXwbWzBtICAgICAgIBtbMDsxOzM1Ozk1bXwbWzBtIBtbMDsxOzMxOzkxbXwbWzBtICAgIBtbMDsxOzM2Ozk2bXwbWzBtICAbWzA7MTszNDs5NG1fG1swOzE7MzU7OTVtX18bWzA7MTszMTs5MW0vG1swbSAKICAbWzA7MTszNDs5NG0vG1swbSAbWzA7MTszNTs5NW0uG1swbSAbWzA7MTszMTs5MW1cG1swbSAgG1swOzE7MzM7OTNtfBtbMG0gG1swOzE7MzI7OTJtfBtbMG0gIBtbMDsxOzM0Ozk0bXwbWzBtIBtbMDsxOzM1Ozk1bXwbWzBtICAgIBtbMDsxOzMzOzkzbXwbWzBtIBtbMDsxOzMyOzkybXwbWzBtICAgICAgIBtbMDsxOzMxOzkxbXwbWzBtIBtbMDsxOzMzOzkzbXwbWzBtICAgIBtbMDsxOzM0Ozk0bXwbWzBtIBtbMDsxOzM1Ozk1bXwbWzBtICAgICAKIBtbMDsxOzM0Ozk0bS8bWzA7MTszNTs5NW1fLxtbMG0gG1swOzE7MzE7OTFtXBtbMDsxOzMzOzkzbV9cG1swbSAbWzA7MTszMjs5Mm18G1swOzE7MzY7OTZtX3wbWzBtICAbWzA7MTszNTs5NW18XxtbMDsxOzMxOzkxbXwbWzBtICAgIBtbMDsxOzMyOzkybXwbWzA7MTszNjs5Nm1ffBtbMG0gICAgICAgG1swOzE7MzM7OTNtfBtbMDsxOzMyOzkybV98G1swbSAgICAbWzA7MTszNTs5NW18XxtbMDsxOzMxOzkxbXwbWzBtICAgICAKCkNvcHlyaWdodCAoQykgenhjdm9zIHwgaHR0cHM6Ly9naXRodWIuY29tL3p4Y3Zvcy9YcmF5LXNjcmlwdAoK" | base64 --decode
@@ -477,32 +488,83 @@ function print_banner() {
 # 参数: 无 (直接使用全局变量 SCRIPT_CONFIG_PATH 和 I18N_DATA)
 # 返回值: 无 (直接打印到标准错误输出 >&2)
 # =============================================================================
+function get_systemd_service_status() {
+    local svc="$1"
+    local running_text=""
+    local stopped_text=""
+    local failed_text=""
+    local not_installed_text="$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.status.not_installed")"
+
+    if [[ "${CURRENT_LANG}" == "zh" ]]; then
+        running_text="运行中"
+        stopped_text="已停止"
+        failed_text="异常 (failed)"
+    else
+        running_text="Running"
+        stopped_text="Stopped"
+        failed_text="Failed"
+    fi
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        printf '%b' "${RED}${stopped_text}${NC}"
+        return 0
+    fi
+
+    if [[ ! -f "/etc/systemd/system/${svc}.service" && ! -f "/lib/systemd/system/${svc}.service" ]] && ! command -v "${svc}" >/dev/null 2>&1; then
+        printf '%b' "${RED}${not_installed_text}${NC}"
+        return 0
+    fi
+
+    local state=""
+    state="$(systemctl is-active "${svc}" 2>/dev/null || true)"
+    case "${state}" in
+    active)
+        printf '%b' "${GREEN}${running_text}${NC}"
+        ;;
+    failed)
+        printf '%b' "${RED}${failed_text}${NC}"
+        ;;
+    *)
+        printf '%b' "${RED}${stopped_text}${NC}"
+        ;;
+    esac
+}
+
 function print_status() {
     # 读取脚本配置文件的完整 JSON 内容
-    local SCRIPT_CONFIG=$(jq '.' "${SCRIPT_CONFIG_PATH}")
+    local SCRIPT_CONFIG="{}"
+    [[ -f "${SCRIPT_CONFIG_PATH}" ]] && SCRIPT_CONFIG="$(jq '.' "${SCRIPT_CONFIG_PATH}" 2>/dev/null || echo '{}')"
 
-    # 从配置中提取 Xray 版本、配置标签和 WARP 状态
-    local XRAY_VERSION=$(echo "${SCRIPT_CONFIG}" | jq -r '.xray.version')
-    local CONFIG_TAG=$(echo "${SCRIPT_CONFIG}" | jq -r '.xray.tag')
-    local WARP_STATUS=$(echo "${SCRIPT_CONFIG}" | jq -r '.xray.warp')
+    # 从配置中提取 Xray 版本、配置标签和 WARP 状态（过滤 JSON null）
+    local XRAY_VERSION="$(echo "${SCRIPT_CONFIG}" | jq -r '.xray.version // empty')"
+    local CONFIG_TAG="$(echo "${SCRIPT_CONFIG}" | jq -r '.xray.tag // empty')"
+    local WARP_STATUS="$(echo "${SCRIPT_CONFIG}" | jq -r '.xray.warp // 0')"
+    local CONFIG_TAG_LOWER="${CONFIG_TAG,,}"
 
     # 从 i18n 数据中读取状态描述文本
-    local not_installed=$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.status.not_installed")
-    local not_configured=$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.status.not_configured")
-    local enabled=$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.status.enabled")
-    local disabled=$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.status.disabled")
+    local not_installed="$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.status.not_installed")"
+    local not_configured="$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.status.not_configured")"
+    local enabled="$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.status.enabled")"
+    local disabled="$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.status.disabled")"
+
+    # 获取 Xray 实时运行状态
+    local XRAY_SERVICE_STATUS="$(get_systemd_service_status xray)"
 
     # 根据 Xray 版本是否存在，设置显示颜色和文本
-    [[ ${XRAY_VERSION} ]] && XRAY_VERSION="${GREEN}${XRAY_VERSION}${NC}" || XRAY_VERSION="${RED}${not_installed}${NC}"
+    [[ -n "${XRAY_VERSION}" ]] && XRAY_VERSION="${GREEN}${XRAY_VERSION}${NC}" || XRAY_VERSION="${RED}${not_installed}${NC}"
     # 根据配置标签是否存在，设置显示颜色和文本
-    [[ ${CONFIG_TAG} ]] && CONFIG_TAG="${GREEN}${CONFIG_TAG}${NC}" || CONFIG_TAG="${RED}${not_configured}${NC}"
-    # 根据 WARP 状态 (1 或 0)，设置显示颜色和文本
-    [[ ${WARP_STATUS} -eq 1 ]] && WARP_STATUS="${GREEN}${enabled}${NC}" || WARP_STATUS="${RED}${disabled}${NC}"
+    [[ -n "${CONFIG_TAG}" ]] && CONFIG_TAG="${GREEN}${CONFIG_TAG}${NC}" || CONFIG_TAG="${RED}${not_configured}${NC}"
+    # 根据 WARP 状态 (1 或 0)，设置显示颜色和文本（使用字符串比对避免空值/非数字报错）
+    [[ "${WARP_STATUS}" == "1" ]] && WARP_STATUS="${GREEN}${enabled}${NC}" || WARP_STATUS="${RED}${disabled}${NC}"
 
     # 打印状态信息
     echo -e "------------------------------------------------------"
     echo -e "Xray       : ${XRAY_VERSION}"
+    echo -e "Status     : ${XRAY_SERVICE_STATUS}"
     echo -e "CONFIG     : ${CONFIG_TAG}"
+    if [[ "${CONFIG_TAG_LOWER}" == "sni" ]]; then
+        echo -e "Nginx      : $(get_systemd_service_status nginx)"
+    fi
     echo -e "WARP Proxy : ${WARP_STATUS}"
     echo -e "------------------------------------------------------"
     echo
@@ -521,10 +583,10 @@ function get_choose() {
 
     # 根据参数决定提示信息
     if [[ "$i18n" == '--language' ]]; then
-        printf "请选择你的语言(默认: 中文, 0 返回): " >&2
+        printf '%s' "请选择你的语言(默认: 中文, 0 返回): " >&2
     else
         # 从 i18n 数据中读取通用提示信息
-        printf "${YELLOW}[$(echo "$I18N_DATA" | jq -r '.title.tip')] ${NC} $(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.choose"): " >&2
+        printf '%b[%s]%b %s: ' "${YELLOW}" "$(echo "$I18N_DATA" | jq -r '.title.tip')" "${NC}" "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.choose")" >&2
     fi
 
     # 从标准输入读取用户输入 (EOF 时视为返回)
@@ -532,7 +594,8 @@ function get_choose() {
         return "${CHOOSE_BACK}"
     fi
 
-    # 去除输入首尾空白字符
+    # 去除尾部及首尾空白字符
+    choose="${choose%$'\r'}"
     choose="${choose#"${choose%%[![:space:]]*}"}"
     choose="${choose%"${choose##*[![:space:]]}"}"
 
@@ -548,8 +611,13 @@ function get_choose() {
 
     # 检查输入是否为纯数字
     if [[ ${choose} =~ ^[0-9]+$ ]]; then
-        # 按十进制解析 (自动去除前导零，并防止超范围导致退出码回绕)
-        local num=$((10#${choose}))
+        # 先去除前导零并校验位数，防止超大数字在 64 位整数运算中溢出回绕
+        local trimmed_num="${choose#"${choose%%[!0]*}"}"
+        [[ -z "${trimmed_num}" ]] && trimmed_num="0"
+        if ((${#trimmed_num} > 3)); then
+            return "${CHOOSE_INVALID}"
+        fi
+        local num=$((10#${trimmed_num}))
         if ((num > 250)); then
             return "${CHOOSE_INVALID}"
         fi
@@ -582,6 +650,7 @@ function main() {
 
     # 使用 case 语句根据第一个参数调用对应的菜单或信息显示函数
     case "$1" in
+    --language) ;;                        # 已在上方显示语言菜单
     --index) menu_index >&2 ;;            # 显示主菜单
     --full) menu_full_installation >&2 ;; # 显示完整安装菜单
     --xray) menu_xray >&2 ;;              # 显示 Xray 版本菜单
@@ -594,6 +663,7 @@ function main() {
     --custom-sites) menu_custom_sites >&2 ;;
     --banner) print_banner >&2 ;;         # 显示 Banner
     --status) print_status >&2 ;;         # 显示状态信息
+    *) return "${CHOOSE_INVALID}" ;;      # 未知菜单选项直接返回非法标识
     esac
 
     # 如果不是显示 banner 或状态信息，则提示用户输入选择

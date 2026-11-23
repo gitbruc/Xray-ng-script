@@ -5,7 +5,7 @@
 # Xray-script:
 #   https://github.com/zxcvos/Xray-script
 # =============================================================================
-# 注释: 通过 Qwen3-Coder 生成。
+# 注释: 通过 Gemini-Neon 生成。
 # 脚本名称: generate.sh
 # 功能描述: 生成各种随机或唯一标识符，如端口、UUID、密码、路径等，用于项目配置。
 # 作者: zxcvos
@@ -49,15 +49,15 @@ function generate_random() {
     local custom_min=${1} # 获取第一个参数作为自定义最小值
     local custom_max=${2} # 获取第二个参数作为自定义最大值
 
-    # 使用 /dev/urandom 生成一个无符号32位随机整数
-    local random=$(od -An -N4 -tu4 </dev/urandom)
+    # 使用 /dev/urandom 生成一个无符号32位随机整数，并去除前导空白
+    local random="$(od -An -N4 -tu4 </dev/urandom | tr -d '[:space:]')"
 
     # 检查自定义的最小值和最大值是否为有效正整数，并且最小值小于最大值
-    if [[ ${custom_min} =~ ^[0-9]+$ && ${custom_max} =~ ^[0-9]+$ ]] && ((custom_min < custom_max)); then
+    if [[ ${custom_min} =~ ^[0-9]+$ && ${custom_max} =~ ^[0-9]+$ ]] && ((10#${custom_min} < 10#${custom_max})); then
         # 计算范围大小
-        local range=$((custom_max - custom_min + 1))
+        local range=$((10#${custom_max} - 10#${custom_min} + 1))
         # 使用取模运算将随机数映射到指定范围内，并加上最小值偏移
-        echo $((random % range + custom_min))
+        echo $((10#${random} % range + 10#${custom_min}))
     else
         # 如果参数无效，则直接输出原始随机数
         echo "${random}"
@@ -88,23 +88,24 @@ function generate_uuid() {
     local input="${1}" # 获取可选的输入参数
     local uuid         # 声明用于存储 UUID 的局部变量
 
+    local uuid_regex='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+
+    # 如果提供的输入参数已经是标准格式的 UUID，直接复用（无需依赖 xray 命令）
+    if [[ "${input}" =~ ${uuid_regex} ]]; then
+        uuid="${input}"
     # 检查系统中是否存在 xray 命令
-    if command -v xray &>/dev/null; then
+    elif command -v xray &>/dev/null; then
         # 如果没有提供输入参数
         if [[ -z "${input}" ]]; then
             # 直接生成一个新的 UUID
-            uuid=$(xray uuid)
-        # 如果提供的输入参数已经是标准格式的 UUID
-        elif [[ "${input}" =~ ^[0-9a-fA-F]{8}\b-[0-9a-fA-F]{4}\b-[0-9a-fA-F]{4}\b-[0-9a-fA-F]{4}\b-[0-9a-fA-F]{12}$ ]]; then
-            # 则直接使用该输入作为 UUID
-            uuid=${input}
+            uuid="$(xray uuid)"
         else
             # 否则，使用提供的输入字符串生成一个基于该输入的 UUID
-            uuid=$(xray uuid -i "${input}")
+            uuid="$(xray uuid -i "${input}")"
         fi
     else
         # 如果没有安装 xray，则使用系统方法生成 UUID
-        uuid=$(cat /proc/sys/kernel/random/uuid)
+        uuid="$(cat /proc/sys/kernel/random/uuid)"
     fi
     # 输出生成的 UUID
     echo "${uuid}"
@@ -121,9 +122,9 @@ function generate_password() {
     # 首先生成一个 16 到 64 之间的随机数作为密码长度
     local length=$(generate_random 16 64)
 
-    # 从 /dev/urandom 读取随机字节，通过 tr 过滤出指定字符集，
-    # 再用 fold 按指定长度换行，最后用 head 取第一行作为密码
-    cat /dev/urandom | tr -cd '0-9a-zA-Z!@$%*' | fold -w $length | head -n 1
+    # 在 C locale 下从 /dev/urandom 读取随机字节，过滤出指定字符集并截取指定长度
+    LC_ALL=C tr -cd '0-9a-zA-Z!@$%*' </dev/urandom | head -c "${length}"
+    printf '\n'
 }
 
 # =============================================================================
@@ -140,7 +141,7 @@ function generate_target() {
 
     # 使用 jq 读取配置文件，获取 .target 对象的所有键名(keys)，
     # 然后计算随机索引对键名数组长度取模，从而随机选择一个键名
-    jq -r --argjson random "${random}" '.target | keys | .[$random % length?]' "${SCRIPT_CONFIG_PATH}"
+    jq -r --argjson random "${random}" '(.target // {} | keys) | if length == 0 then empty else .[$random % length] end' "${SCRIPT_CONFIG_PATH}"
 }
 
 # =============================================================================
@@ -161,19 +162,26 @@ function generate_server_names() {
     # 如果 .target 对象中已存在 $key (即 $target)，
     # 则返回原配置；
     # 否则，将新的键值对 ($target: [$target]) 添加到 .target 对象中
-    local SCRIPT_CONFIG=$(jq --arg key "${target}" '
+    local SCRIPT_CONFIG
+    SCRIPT_CONFIG="$(jq --arg key "${target}" '
+    .target = (.target // {}) |
     if .target | has($key) then
         .
     else
         .target += { ($key): [$key] }
     end
-    ' "${SCRIPT_CONFIG_PATH}")
+    ' "${SCRIPT_CONFIG_PATH}")" || return 1
 
-    # 将修改后的配置内容写回配置文件
-    echo "${SCRIPT_CONFIG}" >"${SCRIPT_CONFIG_PATH}" && sleep 2
+    # 仅在 jq 输出非空有效 JSON 时通过临时文件原子写回，避免损坏原配置
+    if [[ -n "${SCRIPT_CONFIG}" ]]; then
+        local tmp_file="${SCRIPT_CONFIG_PATH}.tmp.$$"
+        printf '%s\n' "${SCRIPT_CONFIG}" >"${tmp_file}" && mv -f "${tmp_file}" "${SCRIPT_CONFIG_PATH}" && sleep 2
+    else
+        return 1
+    fi
 
     # 从修改后的配置中提取并输出指定 target 的服务器名称列表
-    echo "${SCRIPT_CONFIG}" | jq --arg key "${target}" '.target[$key]'
+    printf '%s\n' "${SCRIPT_CONFIG}" | jq --arg key "${target}" '.target[$key]'
 }
 
 # =============================================================================
@@ -184,20 +192,31 @@ function generate_server_names() {
 # 注意: 需要确保系统已安装 xray 命令
 # =============================================================================
 function generate_x25519() {
-    # 调用 xray x25519 命令生成密钥对，输出通常为两行：
-    # Private key: <private_key>
-    # Public key: <public_key>
-    local X25519_KEY=$(xray x25519)
+    # 检查 xray 命令是否可用
+    command -v xray >/dev/null 2>&1 || return 1
 
-    # 使用 sed 提取第一行中的私钥部分
-    local PRIVATE_KEY=$(echo "${X25519_KEY}" | sed -ne '1s/.*:\s*//p')
-    # 使用 sed 提取第二行中的公钥部分
-    local PUBLIC_KEY=$(echo "${X25519_KEY}" | sed -ne '2s/.*:\s*//p')
-    # 使用 sed 提取第三行中的哈希部分
-    local HASH32=$(echo "${X25519_KEY}" | sed -ne '3s/.*:\s*//p')
+    # 调用 xray x25519 命令生成密钥对（兼容旧版 Private key/Public key
+    # 以及新版 v25+/v26+ 的 PrivateKey / Password (PublicKey) / Hash32 输出格式）
+    local X25519_KEY=""
+    X25519_KEY="$(xray x25519)" || return 1
+
+    # 优先按字段标签提取，避免警告信息或输出顺序变化导致错位
+    local PRIVATE_KEY=""
+    local PUBLIC_KEY=""
+    local HASH32=""
+    PRIVATE_KEY="$(printf '%s\n' "${X25519_KEY}" | sed -nE '/^[[:space:]]*Private[[:space:]]*Key[[:space:]]*:/I { s/^[^:]*:[[:space:]]*//; s/[[:space:]]*$//; p; q; }')"
+    PUBLIC_KEY="$(printf '%s\n' "${X25519_KEY}" | sed -nE '/^[[:space:]]*(Public[[:space:]]*Key|Password([^:]*)?)[[:space:]]*:/I { s/^[^:]*:[[:space:]]*//; s/[[:space:]]*$//; p; q; }')"
+    HASH32="$(printf '%s\n' "${X25519_KEY}" | sed -nE '/^[[:space:]]*Hash32[[:space:]]*:/I { s/^[^:]*:[[:space:]]*//; s/[[:space:]]*$//; p; q; }')"
+
+    # 若未匹配到已知标签，则回退按行号提取
+    [[ -z "${PRIVATE_KEY}" ]] && PRIVATE_KEY="$(printf '%s\n' "${X25519_KEY}" | sed -nE '1s/^[^:]*:[[:space:]]*//p' | tr -d '[:space:]')"
+    [[ -z "${PUBLIC_KEY}" ]] && PUBLIC_KEY="$(printf '%s\n' "${X25519_KEY}" | sed -nE '2s/^[^:]*:[[:space:]]*//p' | tr -d '[:space:]')"
+    [[ -z "${HASH32}" ]] && HASH32="$(printf '%s\n' "${X25519_KEY}" | sed -nE '3s/^[^:]*:[[:space:]]*//p' | tr -d '[:space:]')"
+
+    [[ -n "${PRIVATE_KEY}" && -n "${PUBLIC_KEY}" ]] || return 1
 
     # 将私钥和公钥，以及哈希用逗号连接后输出
-    echo "${PRIVATE_KEY},${PUBLIC_KEY},${HASH32}"
+    printf '%s,%s,%s\n' "${PRIVATE_KEY}" "${PUBLIC_KEY}" "${HASH32}"
 }
 
 # =============================================================================
@@ -247,8 +266,18 @@ function generate_short_ids() {
     local -a ids=()  # 声明一个数组用于存储生成的 ID
     local -a args=() # 声明一个数组用于存储输入参数
 
-    # 将所有输入参数按空格分割并存入 args 数组
-    IFS=' ' read -r -a args <<<"$@"
+    # 将所有输入参数按空白分割并存入 args 数组
+    local raw_arg=""
+    local -a split_args=()
+    for raw_arg in "$@"; do
+        read -r -a split_args <<<"${raw_arg}"
+        args+=("${split_args[@]}")
+    done
+
+    if ((${#args[@]} == 0)); then
+        echo '[]'
+        return 0
+    fi
 
     # 遍历每个输入参数
     for arg in "${args[@]}"; do
@@ -256,20 +285,16 @@ function generate_short_ids() {
         if [[ $arg =~ ^[0-8]$ ]]; then
             # 调用 generate_short_id 生成对应长度的 ID，
             # 并使用 jq -R 将其转换为 JSON 字符串格式后添加到 ids 数组
-            ids+=($(generate_short_id "${arg}" | jq -R))
+            ids+=("$(generate_short_id "${arg}" | jq -R)")
         else
             # 如果不是数字，则直接将参数作为 ID 值，
             # 同样使用 jq -R 转换为 JSON 字符串格式后添加到 ids 数组
-            ids+=($(echo "${arg}" | jq -R))
+            ids+=("$(printf '%s\n' "${arg}" | jq -R)")
         fi
     done
 
-    # 将 ids 数组中的所有元素作为独立参数传递给 echo，
-    # 然后通过管道传递给 jq：
-    # -s : 将多个输入项收集到一个数组中
-    # unique : 对数组进行去重
-    # sort_by(length) : 按字符串长度对数组元素进行排序
-    echo "${ids[@]}" | jq -s 'unique | sort_by(length)'
+    # 将 ids 数组中的 JSON 字符串逐行传递给 jq 去重并按长度排序
+    printf '%s\n' "${ids[@]}" | jq -s 'unique | sort_by(length)'
 }
 
 # =============================================================================
@@ -283,9 +308,8 @@ function generate_path() {
     # 生成一个 16 到 64 之间的随机数作为路径长度
     local length=$(generate_random 16 64)
 
-    # 从 /dev/urandom 读取随机字节，通过 tr 过滤出字母和数字，
-    # 再用 fold 按指定长度换行，最后用 head 取第一行作为路径主体
-    local domain_path=$(cat /dev/urandom | tr -cd 'a-zA-Z0-9' | fold -w $length | head -n 1)
+    # 在 C locale 下从 /dev/urandom 读取随机字节，过滤出字母和数字并截取指定长度
+    local domain_path="$(LC_ALL=C tr -cd 'a-zA-Z0-9' </dev/urandom | head -c "${length}")"
 
     # 在路径主体前加上 '/' 并输出
     echo "/${domain_path}"
@@ -316,6 +340,7 @@ function main() {
     --short-id) generate_short_id "$@" ;;         # 生成单个 Short ID
     --short-ids) generate_short_ids "$@" ;;       # 生成多个 Short ID
     --path) generate_path ;;                      # 生成路径
+    *) return 1 ;;
     esac
 }
 
