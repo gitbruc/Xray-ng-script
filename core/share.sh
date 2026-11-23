@@ -322,7 +322,7 @@ EOF
     )
 
     # 将生成的 JSON 字符串通过管道传递给 jq 格式化，再传递给 urlencode 进行编码
-    XHTTP_EXTRA_ENCODED="$(echo "${XHTTP_EXTRA}" | jq -c '.' | urlencode)"
+    XHTTP_EXTRA_ENCODED="$(echo "${XHTTP_EXTRA}" | jq -r '.' | urlencode)"
 }
 
 # =============================================================================
@@ -387,7 +387,7 @@ EOF
     )
 
     # 将生成的 JSON 字符串通过管道传递给 jq 格式化，再传递给 urlencode 进行编码
-    XHTTP_EXTRA_ENCODED="$(echo "${XHTTP_EXTRA}" | jq -c '.' | urlencode)"
+    XHTTP_EXTRA_ENCODED="$(echo "${XHTTP_EXTRA}" | jq -r '.' | urlencode)"
 }
 
 # =============================================================================
@@ -414,7 +414,7 @@ EOF
     )
 
     # 将生成的 JSON 字符串通过管道传递给 jq 格式化，再传递给 urlencode 进行编码
-    XHTTP_EXTRA_ENCODED="$(echo "${XHTTP_EXTRA}" | jq -c '.' | urlencode)"
+    XHTTP_EXTRA_ENCODED="$(echo "${XHTTP_EXTRA}" | jq -r '.' | urlencode)"
 }
 
 # =============================================================================
@@ -618,18 +618,18 @@ function show_config() {
 
     # 如果存在额外配置 (XHTTP_EXTRA)，则显示它
     if [[ -n "${XHTTP_EXTRA}" ]]; then
-        printf '------------------ %s ------------------\n' "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.extra")"
+        printf -- '------------------ %s ------------------\n' "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.extra")"
         # 使用 jq 格式化输出额外配置的 JSON
         printf '%s\n' "${XHTTP_EXTRA}" | jq '.'
     fi
 
     # 显示分享链接
-    printf '------------------ %s ------------------\n' "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.link")"
+    printf -- '------------------ %s ------------------\n' "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.link")"
     printf '%s\n' "${SHARE_LINK}"
 
     # 显示分享链接的二维码 (仅在系统安装了 qrencode 时输出)
     if command -v qrencode >/dev/null 2>&1; then
-        printf '------------------ %s ------------------\n' "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.qr")"
+        printf -- '------------------ %s ------------------\n' "$(echo "$I18N_DATA" | jq -r ".${CUR_FILE}.qr")"
         printf '%s' "${SHARE_LINK}" | qrencode -t ansiutf8
     fi
 
